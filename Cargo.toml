@@ -37,7 +37,9 @@ lru = "0.10"
 bitvec = "1.0"
 tempfile = "3.1"
 tdb-succinct = "0.1.1"
+object_store = { version = "0.11", optional = true, features = ["aws", "gcp", "azure"] }
 
 [features]
 noreadlock = []
 eprint_log = []
+object-store = ["dep:object_store"]
