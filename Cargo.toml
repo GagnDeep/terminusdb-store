@@ -44,3 +44,7 @@ noreadlock = []
 eprint_log = []
 rollup_metadata_experimental = []
 object-store = ["dep:object_store"]
+
+[[example]]
+name = "object_store_graph"
+required-features = ["object-store"]
