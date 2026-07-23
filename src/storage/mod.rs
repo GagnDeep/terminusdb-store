@@ -36,6 +36,8 @@ mod locking;
 pub mod memory;
 #[cfg(feature = "object-store")]
 pub mod object;
+#[cfg(feature = "object-store")]
+pub mod object_cache;
 pub mod pack;
 
 pub use cache::*;
@@ -45,4 +47,6 @@ pub use label::*;
 pub use layer::*;
 #[cfg(feature = "object-store")]
 pub use object::*;
+#[cfg(feature = "object-store")]
+pub use object_cache::*;
 pub use pack::*;

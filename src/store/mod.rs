@@ -991,6 +991,46 @@ pub fn open_object_store(
     )
 }
 
+/// Like [`open_object_store`], but inserts a local-disk spill cache of whole
+/// layer archives between the in-memory LRU and the network.
+///
+/// This gives a three-tier read path — bounded in-memory LRU → local disk →
+/// object store — so a warm replica serves layers from local disk without a
+/// round-trip, and a cold replica populates that disk cache as it reads. Because
+/// layers are immutable, disk entries never need invalidation; manage the
+/// directory's size out of band. The returned [`Store`] carries a handle to the
+/// disk tier's [`CacheStats`](crate::storage::object_cache::CacheStatsSnapshot)
+/// via the returned [`DiskSpillArchiveBackend`] for metrics.
+#[cfg(feature = "object-store")]
+pub fn open_object_store_with_cache(
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: impl Into<String>,
+    mem_cache_size: usize,
+    disk_cache_dir: PathBuf,
+) -> (
+    Store,
+    crate::storage::object_cache::DiskSpillArchiveBackend<
+        crate::storage::object::ObjectArchiveBackend,
+    >,
+) {
+    use crate::storage::object::{ObjectArchiveBackend, ObjectLabelStore};
+    use crate::storage::object_cache::DiskSpillArchiveBackend;
+    let prefix = prefix.into();
+    let object_backend = ObjectArchiveBackend::new(store.clone(), prefix.clone());
+    let disk_backend = DiskSpillArchiveBackend::new(object_backend.clone(), disk_cache_dir);
+    // metadata from the origin; data flows in-memory LRU -> disk -> origin.
+    let archive_backend =
+        LruArchiveBackend::new(object_backend, disk_backend.clone(), mem_cache_size);
+    let store = Store::new(
+        ObjectLabelStore::new(store, prefix),
+        CachedLayerStore::new(
+            ArchiveLayerStore::new(archive_backend.clone(), archive_backend),
+            LockingHashMapLayerCache::new(),
+        ),
+    );
+    (store, disk_backend)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
