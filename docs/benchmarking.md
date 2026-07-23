@@ -9,7 +9,7 @@ environment, and reports for each query class:
 - **bytes transferred** per run,
 - **per-request** p50 / p95 / p99 latency (the tail that a deep, many-request query is exposed to).
 
-It covers a cold whole-layer read (the old path), selective existence (present and absent — disk-less), a full scan (disk-less), and durable batched writes through a **bucket-backed WAL** (disk-less).
+It covers a cold whole-layer read (the old path), selective existence (present and absent — disk-less), a full scan (disk-less), durable batched writes through a **bucket-backed WAL** (disk-less), and a **concurrent load test** that drives many queries in flight and reports **object-store requests/second** — the number that predicts request-rate throttling.
 
 ## The three tiers
 
@@ -71,9 +71,22 @@ TDB_OBJECT_STORE_SECRET_ACCESS_KEY=<token-secret> \
 cargo run --release --example bench_object_store --features object-store
 ```
 
-Drive it with concurrent instances / a high `BENCH_REPS` and watch the request mix
-and p99: if you see throttling, the fix is **request coalescing** (fetch contiguous
-structures in one GET), which the harness's request counts will tell you is needed.
+Drive it with the **concurrent load test** — `BENCH_CONCURRENCY` queries in flight —
+and watch **requests/second** and **p99**. AWS S3 caps ~5,500 GET/s per prefix; the
+in-memory tier already shows this path sustaining *hundreds of thousands* of
+requests/s at modest concurrency, so on real S3/R2 throttling (503 SlowDown →
+backoff-inflated p99, then errors if retries exhaust) will appear as you raise
+concurrency. If it does, the fix is **request coalescing** (fetch contiguous
+structures in one GET) — and the harness's requests/s figure is what tells you it is
+needed, and by how much.
+
+```sh
+# throttling probe against R2:
+TDB_OBJECT_STORE_ENDPOINT=https://<accountid>.r2.cloudflarestorage.com \
+TDB_OBJECT_STORE_BUCKET=bench TDB_OBJECT_STORE_ACCESS_KEY_ID=... TDB_OBJECT_STORE_SECRET_ACCESS_KEY=... \
+BENCH_CONCURRENCY=64 BENCH_LOAD=4000 \
+cargo run --release --example bench_object_store --features object-store
+```
 
 > Credentials never go through this repo. Set them in your own shell/CI secret and
 > run the harness yourself; the harness only reads standard `object_store` env vars.
@@ -86,6 +99,8 @@ structures in one GET), which the harness's request counts will tell you is need
 | `BENCH_BASE` | 3000 | base-layer entries (keep > 512 to exercise block-lazy dictionaries) |
 | `BENCH_REPS` | 20 | cold repetitions per read scenario |
 | `BENCH_WRITES` | 50 | small commits in the write scenario |
+| `BENCH_CONCURRENCY` | 1 | queries in flight in the load test |
+| `BENCH_LOAD` | 400 | total queries in the load test |
 
 ## Reading the output
 
