@@ -96,14 +96,31 @@ untouched. Each is differential-tested against the fully-materialized layer.
 **Stage 1 is complete.** Disk-less existence and traversal queries no longer
 materialize whole layers.
 
-### Stage 2 — block-lazy dictionary (biggest RAM component)
-- Extend `SizedDict` (fork/vendor tdb-succinct, or a terminus-side wrapper over its
-  public block codec) to take a `BlockSource` instead of a whole `data: Bytes`, keep
-  `offsets` + `num_entries` resident, and fetch blocks via the Stage-0 cached reader.
-- Batch the `id()` binary-search fetches (fetch a window of blocks per lookup).
-- **Payoff:** dictionaries — usually the largest resident part — become
-  fetch-on-touch, disk-less.
-- **Cost/risk:** modifies an external crate; must preserve upstream parity.
+### Stage 2 — block-lazy dictionary (biggest RAM component) — MECHANISM LANDED, no fork
+Landed as a **terminus-side wrapper over tdb-succinct's public block codec**, so the
+no-fork decision held — `SizedDictBlock::{parse,entry,id,num_entries}` and
+`MonotonicLogArray` are all public, so no change to the external crate was needed.
+- **2a — `id -> string`** (done): `BlockLazyStringDict` (`src/storage/block_lazy.rs`)
+  keeps only the offset table + data-section size resident and fetches the single
+  block holding an id via a ranged read (`get_layer_structure_range`). Differential-
+  tested against the fully-loaded dictionary over a 500-entry, multi-block dict.
+- **2b — `string -> id`** (done): a binary search over block heads
+  (`get_block(mid).entry(0)`), mirroring `SizedDict::id`, touching only the O(log n)
+  blocks the search visits plus the found block. Differential-tested (matches, round-
+  trips, and absent strings) against the full dictionary.
+- **Block cache** (done): a 256-entry LRU of raw block bytes keyed by block index, so
+  the binary search and repeated lookups never re-fetch a block. This is the
+  per-dictionary analogue of the coalescing block reader the design called for.
+- **Payoff:** dictionaries — usually the largest resident part — are now
+  fetch-on-touch in both directions, with only the offset table resident, **without
+  forking tdb-succinct**.
+- **2c — wire into the live selective path** (remaining): replace the whole-dictionary
+  loads in `Store::selective_value_triple_exists` (`get_node_dictionary` etc.) with
+  `BlockLazyStringDict` lookups. Requires plumbing `get_layer_structure_range` up
+  through the `LayerStore` seam (today it lives on `ArchiveBackend`); per the
+  measure-first posture, justify with a byte/RSS measurement first (Stage 1b's
+  string-selective path already transfers ~78% — the dictionaries are what remains to
+  shrink there).
 
 ### Stage 3 — block-lazy rank/select (hardest, likely partial)
 - `BitIndex`/`AdjacencyList`/`WaveletTree` do random indexing + data-dependent
