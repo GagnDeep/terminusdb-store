@@ -1294,14 +1294,12 @@ mod tests {
                 | NegSPAdjacencyListBits
                 | NegSPAdjacencyListBitIndexBlocks
                 | NegSPAdjacencyListBitIndexSBlocks => "s_p adjacency",
-                PosSpOAdjacencyListNums
-                | PosSpOAdjacencyListBits
-                | PosSpOAdjacencyListBitIndexBlocks
+                PosSpOAdjacencyListNums | NegSpOAdjacencyListNums => "sp_o adj: nums",
+                PosSpOAdjacencyListBits | NegSpOAdjacencyListBits => "sp_o adj: bits",
+                PosSpOAdjacencyListBitIndexBlocks
                 | PosSpOAdjacencyListBitIndexSBlocks
-                | NegSpOAdjacencyListNums
-                | NegSpOAdjacencyListBits
                 | NegSpOAdjacencyListBitIndexBlocks
-                | NegSpOAdjacencyListBitIndexSBlocks => "sp_o adjacency",
+                | NegSpOAdjacencyListBitIndexSBlocks => "sp_o adj: rank/select samples",
                 _ => "other",
             }
         }

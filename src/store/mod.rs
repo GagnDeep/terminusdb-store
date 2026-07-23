@@ -880,6 +880,54 @@ enum DictKind {
     Predicate,
 }
 
+/// The layer structures making up one signed (additions or removals) adjacency
+/// index — the `subjects` array plus the s→p and (s,p)→o adjacency lists' `nums`
+/// arrays and bit indexes. Additions and removals differ only by these files.
+#[cfg(feature = "object-store")]
+struct AdjFiles {
+    subjects: crate::storage::consts::LayerFileEnum,
+    sp_nums: crate::storage::consts::LayerFileEnum,
+    sp_bits: crate::storage::consts::LayerFileEnum,
+    sp_blocks: crate::storage::consts::LayerFileEnum,
+    sp_sblocks: crate::storage::consts::LayerFileEnum,
+    spo_nums: crate::storage::consts::LayerFileEnum,
+    spo_bits: crate::storage::consts::LayerFileEnum,
+    spo_blocks: crate::storage::consts::LayerFileEnum,
+    spo_sblocks: crate::storage::consts::LayerFileEnum,
+}
+
+#[cfg(feature = "object-store")]
+const ADJ_POS: AdjFiles = {
+    use crate::storage::consts::LayerFileEnum::*;
+    AdjFiles {
+        subjects: PosSubjects,
+        sp_nums: PosSPAdjacencyListNums,
+        sp_bits: PosSPAdjacencyListBits,
+        sp_blocks: PosSPAdjacencyListBitIndexBlocks,
+        sp_sblocks: PosSPAdjacencyListBitIndexSBlocks,
+        spo_nums: PosSpOAdjacencyListNums,
+        spo_bits: PosSpOAdjacencyListBits,
+        spo_blocks: PosSpOAdjacencyListBitIndexBlocks,
+        spo_sblocks: PosSpOAdjacencyListBitIndexSBlocks,
+    }
+};
+
+#[cfg(feature = "object-store")]
+const ADJ_NEG: AdjFiles = {
+    use crate::storage::consts::LayerFileEnum::*;
+    AdjFiles {
+        subjects: NegSubjects,
+        sp_nums: NegSPAdjacencyListNums,
+        sp_bits: NegSPAdjacencyListBits,
+        sp_blocks: NegSPAdjacencyListBitIndexBlocks,
+        sp_sblocks: NegSPAdjacencyListBitIndexSBlocks,
+        spo_nums: NegSpOAdjacencyListNums,
+        spo_bits: NegSpOAdjacencyListBits,
+        spo_blocks: NegSpOAdjacencyListBitIndexBlocks,
+        spo_sblocks: NegSpOAdjacencyListBitIndexSBlocks,
+    }
+};
+
 /// Resolve `s` to its in-layer id via the fully-loaded dictionary (the fallback
 /// used when the backend does not support ranged block reads).
 async fn resolve_full(
@@ -978,19 +1026,69 @@ impl Store {
         // `retrieve_layer_stack_names` returns the chain base-first; walk it
         // head-first so the newest layer that mentions the triple wins.
         let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        // When the backend supports ranged reads, resolve existence via block-
+        // lazy adjacency (fetch only the touched `nums` words, not the whole
+        // adjacency array); otherwise use the whole-structure primitives.
+        #[cfg(feature = "object-store")]
+        let block_source = self.layer_store.block_source();
         for &layer in chain.iter().rev() {
-            if self
-                .layer_store
-                .triple_addition_exists(layer, triple.subject, triple.predicate, triple.object)
-                .await?
-            {
+            let (added, removed) = {
+                #[cfg(feature = "object-store")]
+                {
+                    if let Some(src) = &block_source {
+                        (
+                            self.block_lazy_sign_exists(src, layer, &ADJ_POS, triple)
+                                .await?,
+                            self.block_lazy_sign_exists(src, layer, &ADJ_NEG, triple)
+                                .await?,
+                        )
+                    } else {
+                        (
+                            self.layer_store
+                                .triple_addition_exists(
+                                    layer,
+                                    triple.subject,
+                                    triple.predicate,
+                                    triple.object,
+                                )
+                                .await?,
+                            self.layer_store
+                                .triple_removal_exists(
+                                    layer,
+                                    triple.subject,
+                                    triple.predicate,
+                                    triple.object,
+                                )
+                                .await?,
+                        )
+                    }
+                }
+                #[cfg(not(feature = "object-store"))]
+                {
+                    (
+                        self.layer_store
+                            .triple_addition_exists(
+                                layer,
+                                triple.subject,
+                                triple.predicate,
+                                triple.object,
+                            )
+                            .await?,
+                        self.layer_store
+                            .triple_removal_exists(
+                                layer,
+                                triple.subject,
+                                triple.predicate,
+                                triple.object,
+                            )
+                            .await?,
+                    )
+                }
+            };
+            if added {
                 return Ok(true);
             }
-            if self
-                .layer_store
-                .triple_removal_exists(layer, triple.subject, triple.predicate, triple.object)
-                .await?
-            {
+            if removed {
                 return Ok(false);
             }
         }
@@ -1117,6 +1215,139 @@ impl Store {
             .get_value_dictionary(layer)
             .await?
             .and_then(|vd| vd.id_entry(v).into_option()))
+    }
+
+    /// Whether the id-triple exists in one signed adjacency index (additions or
+    /// removals) of `layer`, using block-lazy reads: the two bit indexes are
+    /// small and loaded whole, while the large `nums` arrays are read one element
+    /// at a time via [`BlockLazyLogArray`]. Mirrors `layer_triple_exists` /
+    /// `sp_o_position` exactly. Returns `false` if the index is absent (e.g. a
+    /// base layer has no removals).
+    ///
+    /// [`BlockLazyLogArray`]: crate::storage::block_lazy::BlockLazyLogArray
+    #[cfg(feature = "object-store")]
+    async fn block_lazy_sign_exists(
+        &self,
+        src: &std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>,
+        layer: [u32; 5],
+        files: &AdjFiles,
+        triple: IdTriple,
+    ) -> io::Result<bool> {
+        use crate::storage::block_lazy::BlockLazyLogArray;
+        use tdb_succinct::{BitIndex, MonotonicLogArray};
+
+        let (subject, predicate, object) = (triple.subject, triple.predicate, triple.object);
+        if subject == 0 || predicate == 0 || object == 0 {
+            return Ok(false);
+        }
+
+        // Load a bit index whole (bits + rank/select samples are small). Absence
+        // of the bits structure means this signed index does not exist here.
+        async fn bit_index(
+            src: &std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>,
+            layer: [u32; 5],
+            bits: crate::storage::consts::LayerFileEnum,
+            blocks: crate::storage::consts::LayerFileEnum,
+            sblocks: crate::storage::consts::LayerFileEnum,
+        ) -> io::Result<Option<BitIndex>> {
+            let bits = match src.structure_bytes(layer, bits).await? {
+                Some(b) if !b.is_empty() => b,
+                _ => return Ok(None),
+            };
+            let blocks = src
+                .structure_bytes(layer, blocks)
+                .await?
+                .unwrap_or_default();
+            let sblocks = src
+                .structure_bytes(layer, sblocks)
+                .await?
+                .unwrap_or_default();
+            Ok(Some(BitIndex::from_maps(bits, blocks, sblocks)))
+        }
+
+        let sp_bits =
+            match bit_index(src, layer, files.sp_bits, files.sp_blocks, files.sp_sblocks).await? {
+                Some(b) => b,
+                None => return Ok(false),
+            };
+        let spo_bits = match bit_index(
+            src,
+            layer,
+            files.spo_bits,
+            files.spo_blocks,
+            files.spo_sblocks,
+        )
+        .await?
+        {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+        let sp_nums = BlockLazyLogArray::open(src.clone(), layer, files.sp_nums).await?;
+        let spo_nums = BlockLazyLogArray::open(src.clone(), layer, files.spo_nums).await?;
+
+        // Optional subject id-map (present on child layers; absent on base, where
+        // the subject id is used directly).
+        let subjects: Option<MonotonicLogArray> =
+            match src.structure_bytes(layer, files.subjects).await? {
+                Some(b) if !b.is_empty() => Some(MonotonicLogArray::parse(b).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("subjects: {:?}", e))
+                })?),
+                _ => None,
+            };
+
+        // `AdjacencyList::offset_for(index)`.
+        let offset_for = |bits: &BitIndex, index: u64| -> u64 {
+            if index == 1 {
+                0
+            } else {
+                bits.select1(index - 1).unwrap() + 1
+            }
+        };
+
+        // Locate the subject's row in the s→p list (mirrors `sp_o_position`).
+        let s_position = match &subjects {
+            None => {
+                let left_count = if sp_bits.len() == 0 {
+                    0
+                } else {
+                    sp_bits.rank1(sp_bits.len() as u64 - 1)
+                };
+                if subject > left_count {
+                    return Ok(false);
+                }
+                subject - 1
+            }
+            Some(subjects) => match subjects.index_of(subject) {
+                Some(pos) => pos as u64,
+                None => return Ok(false),
+            },
+        };
+
+        let mut sp_pos = offset_for(&sp_bits, s_position + 1);
+        loop {
+            let bit = sp_bits.get(sp_pos);
+            if sp_nums.entry(sp_pos as usize).await? == predicate {
+                break;
+            }
+            if bit {
+                return Ok(false); // past this subject's predicates
+            }
+            sp_pos += 1;
+        }
+
+        // Scan the (s,p) row of the (s,p)→o list for the object.
+        let mut spo_pos = offset_for(&spo_bits, sp_pos + 1);
+        loop {
+            let bit = spo_bits.get(spo_pos);
+            if spo_nums.entry(spo_pos as usize).await? == object {
+                return Ok(true);
+            }
+            if bit {
+                break; // past this (s,p) pair's objects
+            }
+            spo_pos += 1;
+        }
+        Ok(false)
     }
 
     /// Like [`selective_id_triple_exists`](Self::selective_id_triple_exists) but
