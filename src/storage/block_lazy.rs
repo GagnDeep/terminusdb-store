@@ -13,12 +13,23 @@
 //! already-async selective read path rather than the synchronous `Layer`
 //! accessors.
 //!
-//! This is the read (`id -> string`) direction. The `string -> id` direction
-//! (a binary search over block heads) is a further increment.
+//! Both directions are block-lazy: `id -> string` ([`entry`]/[`get_string`])
+//! fetches the single block holding the id, and `string -> id` ([`id`]/
+//! [`id_of_string`]) binary-searches block heads, touching only the O(log n)
+//! blocks the search visits. Fetched blocks are cached (keyed by block index)
+//! so the binary search and repeated lookups never re-fetch a block.
+//!
+//! [`entry`]: BlockLazyStringDict::entry
+//! [`get_string`]: BlockLazyStringDict::get_string
+//! [`id`]: BlockLazyStringDict::id
+//! [`id_of_string`]: BlockLazyStringDict::id_of_string
 
 use std::io;
+use std::num::NonZeroUsize;
+use std::sync::Mutex;
 
 use bytes::Bytes;
+use lru::LruCache;
 use tdb_succinct::block::{IdLookupResult, SizedDictBlock};
 use tdb_succinct::{MonotonicLogArray, SizedDictEntry};
 
@@ -39,6 +50,9 @@ pub struct BlockLazyStringDict<B> {
     offsets: Option<MonotonicLogArray>,
     /// Total byte length of the data (blocks) structure.
     data_len: usize,
+    /// LRU cache of already-fetched block bytes, keyed by block index, so the
+    /// `id()` binary search (and repeated lookups) never re-fetches a block.
+    block_cache: Mutex<LruCache<usize, Bytes>>,
 }
 
 impl<B: ArchiveBackend + ArchiveMetadataBackend> BlockLazyStringDict<B> {
@@ -70,6 +84,7 @@ impl<B: ArchiveBackend + ArchiveMetadataBackend> BlockLazyStringDict<B> {
             blocks_file,
             offsets,
             data_len,
+            block_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
         })
     }
 
@@ -96,13 +111,25 @@ impl<B: ArchiveBackend + ArchiveMetadataBackend> BlockLazyStringDict<B> {
         (start, end)
     }
 
-    /// Fetch and parse one data block via a ranged read.
+    /// Fetch and parse one data block via a ranged read, caching the raw block
+    /// bytes so a repeat fetch is served from memory (parse itself is cheap).
     async fn get_block(&self, block_index: usize) -> io::Result<SizedDictBlock> {
-        let (start, end) = self.block_range(block_index);
-        let mut bytes: Bytes = self
-            .backend
-            .get_layer_structure_range(self.layer, self.blocks_file, start..end)
-            .await?;
+        let cached = self.block_cache.lock().unwrap().get(&block_index).cloned();
+        let mut bytes: Bytes = match cached {
+            Some(b) => b,
+            None => {
+                let (start, end) = self.block_range(block_index);
+                let fetched = self
+                    .backend
+                    .get_layer_structure_range(self.layer, self.blocks_file, start..end)
+                    .await?;
+                self.block_cache
+                    .lock()
+                    .unwrap()
+                    .put(block_index, fetched.clone());
+                fetched
+            }
+        };
         SizedDictBlock::parse(&mut bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("block: {:?}", e)))
     }
