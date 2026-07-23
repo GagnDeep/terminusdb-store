@@ -293,6 +293,34 @@ impl ArchiveBackend for ObjectArchiveBackend {
             .map_err(os_err_to_io)?;
         Ok(BytesReader(result.bytes().await.map_err(os_err_to_io)?))
     }
+
+    async fn get_layer_structure_range(
+        &self,
+        id: [u32; 5],
+        file_type: LayerFileEnum,
+        range: std::ops::Range<usize>,
+    ) -> io::Result<Bytes> {
+        let (header, data_start) = self.layer_header(id).await?;
+        let sr = header
+            .range_for(file_type)
+            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "structure not found in archive"))?;
+        let base = data_start + sr.start;
+        let abs_start = base + range.start;
+        let abs_end = (base + range.end).min(data_start + sr.end);
+        if abs_start >= abs_end {
+            return Ok(Bytes::new());
+        }
+        let opts = GetOptions {
+            range: Some(GetRange::Bounded(abs_start..abs_end)),
+            ..Default::default()
+        };
+        let result = self
+            .store
+            .get_opts(&self.layer_key(id), opts)
+            .await
+            .map_err(os_err_to_io)?;
+        result.bytes().await.map_err(os_err_to_io)
+    }
 }
 
 #[async_trait]
