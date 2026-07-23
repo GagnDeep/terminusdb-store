@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 use crate::layer::{IdTriple, Layer, LayerBuilder, LayerCounts, ObjectType, ValueTriple};
 use crate::store::{
-    open_directory_store, open_memory_store, NamedGraph, Store, StoreLayer, StoreLayerBuilder,
+    open_directory_store, open_memory_store, LazyLayer, NamedGraph, Store, StoreLayer,
+    StoreLayerBuilder,
 };
 use tdb_succinct::TypedDictEntry;
 
@@ -517,6 +518,91 @@ impl SyncNamedGraph {
     }
 }
 
+/// Synchronous, **disk-less** query handle over one graph — the sync twin of
+/// [`LazyLayer`], and the integration seam for a synchronous query engine that
+/// wants the block-lazy read path.
+///
+/// Every method mirrors the like-named method on the [`Layer`] trait (which the
+/// materialized [`SyncStoreLayer`] implements), but answers it by fetching only
+/// the blocks a query touches instead of loading a whole layer. So a caller can
+/// swap a materialized `SyncStoreLayer` for a `SyncLazyLayer` to make a read path
+/// disk-less, changing only where the layer handle comes from. Each call blocks
+/// on the shared runtime, exactly like the rest of this facade.
+///
+/// Obtain one with [`SyncStore::lazy_layer`].
+#[derive(Clone)]
+pub struct SyncLazyLayer {
+    inner: LazyLayer,
+}
+
+impl SyncLazyLayer {
+    /// The head layer id this handle reads.
+    pub fn name(&self) -> [u32; 5] {
+        self.inner.name()
+    }
+
+    // ---- existence ----
+    pub fn triple_exists(&self, subject: u64, predicate: u64, object: u64) -> io::Result<bool> {
+        task_sync(self.inner.triple_exists(subject, predicate, object))
+    }
+    pub fn id_triple_exists(&self, triple: IdTriple) -> io::Result<bool> {
+        task_sync(self.inner.id_triple_exists(triple))
+    }
+    pub fn value_triple_exists(&self, triple: &ValueTriple) -> io::Result<bool> {
+        task_sync(self.inner.value_triple_exists(triple))
+    }
+
+    // ---- traversal ----
+    pub fn triples_s(&self, subject: u64) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_s(subject))
+    }
+    pub fn triples_sp(&self, subject: u64, predicate: u64) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_sp(subject, predicate))
+    }
+    pub fn triples_p(&self, predicate: u64) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_p(predicate))
+    }
+    pub fn triples_o(&self, object: u64) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_o(object))
+    }
+    /// Every id-triple in the graph, disk-lessly (adjacency-only, merge-streamed).
+    pub fn triples(&self) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triples())
+            .map(|it| Box::new(it) as Box<dyn Iterator<Item = IdTriple> + Send>)
+    }
+
+    // ---- forward resolution (string -> id) ----
+    pub fn subject_id(&self, subject: &str) -> io::Result<Option<u64>> {
+        task_sync(self.inner.subject_id(subject))
+    }
+    pub fn predicate_id(&self, predicate: &str) -> io::Result<Option<u64>> {
+        task_sync(self.inner.predicate_id(predicate))
+    }
+    pub fn object_node_id(&self, object: &str) -> io::Result<Option<u64>> {
+        task_sync(self.inner.object_node_id(object))
+    }
+    pub fn object_value_id(&self, object: &TypedDictEntry) -> io::Result<Option<u64>> {
+        task_sync(self.inner.object_value_id(object))
+    }
+    pub fn value_triple_to_id(&self, triple: &ValueTriple) -> io::Result<Option<IdTriple>> {
+        task_sync(self.inner.value_triple_to_id(triple))
+    }
+
+    // ---- reverse resolution (id -> string/value) ----
+    pub fn id_subject(&self, id: u64) -> io::Result<Option<String>> {
+        task_sync(self.inner.id_subject(id))
+    }
+    pub fn id_predicate(&self, id: u64) -> io::Result<Option<String>> {
+        task_sync(self.inner.id_predicate(id))
+    }
+    pub fn id_object(&self, id: u64) -> io::Result<Option<ObjectType>> {
+        task_sync(self.inner.id_object(id))
+    }
+    pub fn id_triple_to_string(&self, triple: IdTriple) -> io::Result<Option<ValueTriple>> {
+        task_sync(self.inner.id_triple_to_string(triple))
+    }
+}
+
 /// A store, storing a set of layers and database labels pointing to these layers.
 #[derive(Clone)]
 pub struct SyncStore {
@@ -564,6 +650,19 @@ impl SyncStore {
         let inner = task_sync(self.inner.get_layer_from_id(layer));
 
         inner.map(|layer| layer.map(SyncStoreLayer::wrap))
+    }
+
+    /// A **disk-less** query handle over the graph headed by `layer`: the common
+    /// read operations answered by fetching only the blocks a query touches,
+    /// without materializing a whole layer (unlike [`get_layer_from_id`]). This
+    /// is the synchronous integration seam for a query engine that wants the
+    /// disk-less read path but is itself synchronous. See [`SyncLazyLayer`].
+    ///
+    /// [`get_layer_from_id`]: Self::get_layer_from_id
+    pub fn lazy_layer(&self, layer: [u32; 5]) -> SyncLazyLayer {
+        SyncLazyLayer {
+            inner: self.inner.lazy_layer(layer),
+        }
     }
 
     /// Create a base layer builder, unattached to any database label.
@@ -638,6 +737,71 @@ pub fn open_sync_raw_archive_store<P: Into<PathBuf>>(path: P) -> SyncStore {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // The synchronous disk-less handle must answer exactly like the materialized
+    // sync layer, over a graph large enough to drive the block-lazy path.
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn sync_lazy_layer_matches_materialized_disk_less() {
+        use crate::store::open_object_store;
+        use std::sync::Arc;
+
+        let bucket: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let store = SyncStore::wrap(open_object_store(bucket, "", 1 << 30));
+        let db = store.create("g").unwrap();
+        let builder = store.create_base_layer().unwrap();
+        for i in 0..700 {
+            builder
+                .add_value_triple(ValueTriple::new_string_value(
+                    &format!("n{:04}", i),
+                    "p",
+                    &format!("o{:04}", i),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap();
+        db.set_head(&layer).unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).unwrap().unwrap(); // materialized (Layer)
+        let lazy = store.lazy_layer(head); // disk-less
+        assert_eq!(head, lazy.name());
+
+        // forward resolution + existence
+        let sid = full.subject_id("n0100");
+        assert!(sid.is_some());
+        assert_eq!(sid, lazy.subject_id("n0100").unwrap());
+        assert_eq!(full.predicate_id("p"), lazy.predicate_id("p").unwrap());
+        let vt = ValueTriple::new_string_value("n0100", "p", "o0100");
+        assert!(lazy.value_triple_exists(&vt).unwrap());
+        assert_eq!(
+            full.value_triple_to_id(&vt),
+            lazy.value_triple_to_id(&vt).unwrap()
+        );
+
+        // traversal + reverse resolution
+        let s = sid.unwrap();
+        let mut a: Vec<IdTriple> = full.triples_s(s).collect();
+        let mut b = lazy.triples_s(s).unwrap();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+        assert_eq!(full.id_subject(s), lazy.id_subject(s).unwrap());
+        for t in &a {
+            assert_eq!(
+                full.id_triple_to_string(t),
+                lazy.id_triple_to_string(*t).unwrap()
+            );
+        }
+
+        // full scan
+        let mut es: Vec<IdTriple> = full.triples().collect();
+        let mut ls: Vec<IdTriple> = lazy.triples().unwrap().collect();
+        es.sort();
+        ls.sort();
+        assert_eq!(es, ls);
+    }
 
     #[test]
     fn create_and_manipulate_sync_memory_database() {
