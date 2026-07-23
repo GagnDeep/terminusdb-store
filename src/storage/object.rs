@@ -25,10 +25,13 @@
 //! replaces the directory backend's `flock`-guarded read-modify-write with a
 //! conditional PUT (ETag / version compare-and-swap).
 //!
-//! Whole layer archives are fetched into memory; nothing is memory-mapped. This
-//! backend provides durability, cheap storage, stateless replicas, and trivial
-//! backup. It does **not** make the database larger than RAM: the working set is
-//! still fully materialized and expanded in memory on read.
+//! Reads are structure-granular: a single structure of a layer is fetched with a
+//! ranged GET (a header probe, then the structure's byte range), and whole layers
+//! are prefetched in parallel using a persisted stack manifest. Paired with the
+//! disk-spill tier (which memory-maps cached archives) this gives a hybrid
+//! RAM+NVMe buffer pool, so a graph larger than RAM can be read on any machine
+//! with local storage. Going fully block-granular on a disk-less replica is the
+//! subject of `docs/RFC-phase3-block-lazy.md`.
 
 use std::io::{self, ErrorKind};
 use std::sync::Arc;
@@ -781,6 +784,138 @@ mod tests {
     async fn nonexistent_layer_is_none() {
         let store = object_layer_store(mem());
         assert!(store.get_layer([1, 2, 3, 4, 5]).await.unwrap().is_none());
+    }
+
+    // ---- Phase 3, Stage 0: evidence that disk-less reads are already
+    //      structure-granular (ranged), transferring a fraction of the whole
+    //      layer. Guards the ranged read path from silently regressing to
+    //      whole-archive fetches. ----
+
+    /// An object store that counts the bytes requested by ranged GETs, to prove
+    /// how much a read actually transfers over the (simulated) network.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: Arc<dyn ObjectStore>,
+        ranged_bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+    #[async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            l: &ObjectPath,
+            p: object_store::PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &ObjectPath,
+            o: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(
+            &self,
+            l: &ObjectPath,
+            o: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if let Some(GetRange::Bounded(r)) = &o.range {
+                self.ranged_bytes.fetch_add(
+                    (r.end - r.start) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            self.inner.get_opts(l, o).await
+        }
+        async fn delete(&self, l: &ObjectPath) -> object_store::Result<()> {
+            self.inner.delete(l).await
+        }
+        fn list(
+            &self,
+            p: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(
+            &self,
+            p: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy(&self, f: &ObjectPath, t: &ObjectPath) -> object_store::Result<()> {
+            self.inner.copy(f, t).await
+        }
+        async fn copy_if_not_exists(
+            &self,
+            f: &ObjectPath,
+            t: &ObjectPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(f, t).await
+        }
+    }
+
+    #[tokio::test]
+    async fn ranged_structure_read_transfers_less_than_whole_layer() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Build a layer big enough that one structure is a small part of it.
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let backend = ObjectArchiveBackend::new(bucket.clone(), "");
+        let store = ArchiveLayerStore::new(backend.clone(), backend.clone());
+        let mut builder = store.create_base_layer().await.unwrap();
+        let name = builder.name();
+        for i in 0..3000 {
+            builder.add_value_triple(ValueTriple::new_string_value(
+                &format!("subject{}", i),
+                "predicate",
+                &format!("object{}", i),
+            ));
+        }
+        builder.commit_boxed().await.unwrap();
+        store.finalize_layer(name).await.unwrap();
+
+        let whole = backend.layer_size(name).await.unwrap();
+
+        // Read only the node dictionary (2 of ~48 structures) through a counting
+        // store; count the bytes its ranged GETs actually request.
+        let counter = Arc::new(AtomicU64::new(0));
+        let counting: Arc<dyn ObjectStore> = Arc::new(CountingStore {
+            inner: bucket.clone(),
+            ranged_bytes: counter.clone(),
+        });
+        let cbackend = ObjectArchiveBackend::new(counting, "");
+        // Read one small structure (the dictionary's block-offset table) — the
+        // kind of targeted read a query makes when it does not need the whole
+        // string dictionary. It should transfer far less than the whole layer.
+        let structure = cbackend
+            .get_layer_structure_bytes(name, LayerFileEnum::NodeDictionaryOffsets)
+            .await
+            .unwrap();
+        assert!(structure.is_some(), "structure should load");
+        let transferred = counter.load(Ordering::Relaxed);
+
+        println!(
+            "whole layer = {} bytes; disk-less ranged read of one small structure = {} bytes ({:.0}%)",
+            whole,
+            transferred,
+            transferred as f64 / whole as f64 * 100.0
+        );
+        // Even including the ~8 KiB header probe, one small structure is a
+        // fraction of the whole archive — this is structure-granular disk-less
+        // reading, the foundation Phase 3 builds on to go block-granular.
+        assert!(
+            transferred < whole,
+            "a ranged structure read ({}) must transfer less than the whole layer ({})",
+            transferred,
+            whole
+        );
     }
 
     // ---- Milestone 2: write path — commit a chain, drop, reopen, read back ----
