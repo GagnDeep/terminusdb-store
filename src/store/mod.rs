@@ -845,6 +845,43 @@ fn reconcile_layered(per_layer_head_first: Vec<(Vec<IdTriple>, Vec<IdTriple>)>) 
     v
 }
 
+/// Minimum dictionary size (entries) at which the block-lazy read path is worth
+/// its per-lookup overhead (offset table + O(log n) block fetches). Below this a
+/// dictionary is small enough that one whole-dictionary GET transfers fewer
+/// bytes; above it, fetching only the touched blocks wins. Chosen from the
+/// object-store byte-transfer measurements (~64 blocks).
+#[cfg(feature = "object-store")]
+const BLOCK_LAZY_MIN_ENTRIES: u64 = 512;
+
+/// Which string dictionary a selective resolution targets. Nodes and predicates
+/// are both string dictionaries and share resolution logic; only the dictionary
+/// files and id-map differ.
+#[derive(Clone, Copy)]
+enum DictKind {
+    Node,
+    Predicate,
+}
+
+/// Resolve `s` to its in-layer id via the fully-loaded dictionary (the fallback
+/// used when the backend does not support ranged block reads).
+async fn resolve_full(
+    ls: &Arc<dyn LayerStore>,
+    kind: DictKind,
+    layer: [u32; 5],
+    s: &str,
+) -> io::Result<Option<u64>> {
+    Ok(match kind {
+        DictKind::Node => ls
+            .get_node_dictionary(layer)
+            .await?
+            .and_then(|d| d.id(&s).into_option()),
+        DictKind::Predicate => ls
+            .get_predicate_dictionary(layer)
+            .await?
+            .and_then(|d| d.id(&s).into_option()),
+    })
+}
+
 impl Store {
     /// Create a new store from the given label and layer store.
     pub fn new<Labels: 'static + LabelStore, Layers: 'static + LayerStore>(
@@ -928,6 +965,90 @@ impl Store {
         Ok(false)
     }
 
+    /// Resolve a node/predicate string to its global id by walking the chain
+    /// head-first. When the backend supports ranged structure reads (object
+    /// store), each per-layer lookup uses a [`BlockLazyStringDict`] that fetches
+    /// only the O(log n) dictionary blocks a binary search touches; otherwise it
+    /// loads the whole dictionary. Both yield the same id — the same in-layer
+    /// lookup, id-map `inner_to_outer`, and cumulative-offset shift.
+    ///
+    /// [`BlockLazyStringDict`]: crate::storage::block_lazy::BlockLazyStringDict
+    async fn resolve_dict_id(
+        &self,
+        chain: &[[u32; 5]],
+        offsets: &[u64],
+        kind: DictKind,
+        s: &str,
+    ) -> io::Result<Option<u64>> {
+        let ls = &self.layer_store;
+        #[cfg(feature = "object-store")]
+        let block_source = ls.block_source();
+        for i in (0..chain.len()).rev() {
+            let layer = chain[i];
+            // Skip layers whose dictionary is empty (0 new nodes/predicates):
+            // the string can only be introduced by a layer that actually adds
+            // it. This also avoids parsing an empty dictionary's zero-filled
+            // block structure, which the block codec rejects.
+            let count = match kind {
+                DictKind::Node => ls.get_node_count(layer).await?,
+                DictKind::Predicate => ls.get_predicate_count(layer).await?,
+            };
+            if count.unwrap_or(0) == 0 {
+                continue;
+            }
+            let local: Option<u64> = {
+                #[cfg(feature = "object-store")]
+                {
+                    // Block-lazy fetches the offset table plus O(log n) blocks;
+                    // for a small dictionary that overhead exceeds one whole-dict
+                    // GET, so only take the block-lazy path once the dictionary is
+                    // large enough to win (measured: it regresses below this).
+                    let use_block_lazy =
+                        count.unwrap_or(0) >= BLOCK_LAZY_MIN_ENTRIES && block_source.is_some();
+                    if let (true, Some(src)) = (use_block_lazy, &block_source) {
+                        let (off_f, blk_f) = match kind {
+                            DictKind::Node => (
+                                crate::storage::consts::LayerFileEnum::NodeDictionaryOffsets,
+                                crate::storage::consts::LayerFileEnum::NodeDictionaryBlocks,
+                            ),
+                            DictKind::Predicate => (
+                                crate::storage::consts::LayerFileEnum::PredicateDictionaryOffsets,
+                                crate::storage::consts::LayerFileEnum::PredicateDictionaryBlocks,
+                            ),
+                        };
+                        crate::storage::block_lazy::BlockLazyStringDict::open(
+                            src.clone(),
+                            layer,
+                            off_f,
+                            blk_f,
+                        )
+                        .await?
+                        .id_of_string(s)
+                        .await?
+                    } else {
+                        resolve_full(ls, kind, layer, s).await?
+                    }
+                }
+                #[cfg(not(feature = "object-store"))]
+                {
+                    resolve_full(ls, kind, layer, s).await?
+                }
+            };
+            if let Some(local) = local {
+                let idmap = match kind {
+                    DictKind::Node => ls.get_node_value_idmap(layer).await?,
+                    DictKind::Predicate => ls.get_predicate_idmap(layer).await?,
+                };
+                let outer = match idmap {
+                    Some(m) => m.inner_to_outer(local),
+                    None => local,
+                };
+                return Ok(Some(outer + offsets[i]));
+            }
+        }
+        Ok(None)
+    }
+
     /// Like [`selective_id_triple_exists`](Self::selective_id_triple_exists) but
     /// for a *string* triple: resolves the subject/predicate/object to ids by
     /// loading only the dictionaries and id-maps of the layers in the chain
@@ -962,60 +1083,36 @@ impl Store {
             cum_pred += ls.get_predicate_count(layer).await?.unwrap_or(0);
         }
 
-        // Resolve a node string (used for subjects and node objects).
-        async fn resolve_node(
-            ls: &Arc<dyn LayerStore>,
-            chain: &[[u32; 5]],
-            off_nv: &[u64],
-            s: &str,
-        ) -> io::Result<Option<u64>> {
-            for i in (0..chain.len()).rev() {
-                if let Some(dict) = ls.get_node_dictionary(chain[i]).await? {
-                    if let Some(local) = dict.id(&s).into_option() {
-                        let outer = match ls.get_node_value_idmap(chain[i]).await? {
-                            Some(m) => m.inner_to_outer(local),
-                            None => local,
-                        };
-                        return Ok(Some(outer + off_nv[i]));
-                    }
-                }
-            }
-            Ok(None)
-        }
-
-        let subject = match resolve_node(ls, &chain, &off_nv, &triple.subject).await? {
+        // Resolve subject and predicate. `resolve_dict_id` uses block-lazy
+        // dictionaries when the backend supports ranged reads, otherwise the
+        // whole-dictionary path — identical results either way.
+        let subject = match self
+            .resolve_dict_id(&chain, &off_nv, DictKind::Node, &triple.subject)
+            .await?
+        {
             Some(id) => id,
             None => return Ok(false),
         };
 
-        // Resolve the predicate.
-        let predicate = {
-            let mut found = None;
-            for i in (0..chain.len()).rev() {
-                if let Some(dict) = ls.get_predicate_dictionary(chain[i]).await? {
-                    let p: &str = &triple.predicate;
-                    if let Some(local) = dict.id(&p).into_option() {
-                        let outer = match ls.get_predicate_idmap(chain[i]).await? {
-                            Some(m) => m.inner_to_outer(local),
-                            None => local,
-                        };
-                        found = Some(outer + off_pred[i]);
-                        break;
-                    }
-                }
-            }
-            match found {
-                Some(id) => id,
-                None => return Ok(false),
-            }
+        let predicate = match self
+            .resolve_dict_id(&chain, &off_pred, DictKind::Predicate, &triple.predicate)
+            .await?
+        {
+            Some(id) => id,
+            None => return Ok(false),
         };
 
         // Resolve the object (node or typed value).
         let object = match &triple.object {
-            ObjectType::Node(n) => match resolve_node(ls, &chain, &off_nv, n).await? {
-                Some(id) => id,
-                None => return Ok(false),
-            },
+            ObjectType::Node(n) => {
+                match self
+                    .resolve_dict_id(&chain, &off_nv, DictKind::Node, n)
+                    .await?
+                {
+                    Some(id) => id,
+                    None => return Ok(false),
+                }
+            }
             ObjectType::Value(v) => {
                 let v: &TypedDictEntry = v;
                 let mut found = None;
@@ -1452,9 +1549,100 @@ mod tests {
 
     #[tokio::test]
     async fn selective_value_triple_exists_matches_full_layer() {
+        selective_value_triple_exists_body(open_memory_store()).await;
+    }
+
+    // Same differential check over an object-backed store (these small
+    // dictionaries stay under the block-lazy threshold, so this exercises the
+    // object selective path's whole-dictionary branch).
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn selective_value_triple_exists_matches_full_layer_object() {
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        selective_value_triple_exists_body(open_object_store(bucket, "", 1 << 30)).await;
+    }
+
+    // Differential check over an object store with dictionaries large enough
+    // (> BLOCK_LAZY_MIN_ENTRIES) that subject and predicate resolution take the
+    // block-lazy path. Verifies block-lazy resolution over the full selective
+    // pipeline agrees with the fully-materialized layer for present, absent, and
+    // removed triples.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn selective_value_triple_exists_block_lazy_large_dict() {
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = open_object_store(bucket, "", 1 << 30);
+        let db = store.create("g").await.unwrap();
+
+        // > 512 distinct subjects and > 512 distinct predicates so both the node
+        // and predicate dictionaries cross the block-lazy threshold.
+        let vn = |s: &str, p: &str, o: &str| ValueTriple::new_node(s, p, o);
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..1200 {
+            builder
+                .add_value_triple(vn(
+                    &format!("subj{:05}", i),
+                    &format!("pred{:05}", i % 700),
+                    &format!("subj{:05}", (i + 1) % 1200),
+                ))
+                .unwrap();
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        // child: remove a few, add a few
+        let builder = layer.open_write().await.unwrap();
+        for i in 0..20 {
+            builder
+                .remove_value_triple(vn(
+                    &format!("subj{:05}", i),
+                    &format!("pred{:05}", i % 700),
+                    &format!("subj{:05}", (i + 1) % 1200),
+                ))
+                .unwrap();
+        }
+        builder
+            .add_value_triple(vn("subj00000", "pred00000", "subj00002"))
+            .unwrap();
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+
+        let mut candidates: Vec<ValueTriple> = Vec::new();
+        for i in (0..1200).step_by(37) {
+            candidates.push(vn(
+                &format!("subj{:05}", i),
+                &format!("pred{:05}", i % 700),
+                &format!("subj{:05}", (i + 1) % 1200),
+            ));
+        }
+        candidates.push(vn("subj00000", "pred00000", "subj00002")); // removed then re-added
+        candidates.push(vn("subj00005", "pred00005", "subj00006")); // removed -> absent
+        candidates.push(vn("absentsubj", "pred00000", "subj00002")); // absent subject
+        candidates.push(vn("subj00010", "absentpred", "subj00011")); // absent predicate
+        candidates.push(vn("subj00010", "pred00010", "subj00099")); // resolvable, absent triple
+
+        for cand in &candidates {
+            let expected = full.value_triple_exists(cand);
+            let got = store
+                .selective_value_triple_exists(head, cand)
+                .await
+                .unwrap();
+            assert_eq!(
+                expected, got,
+                "mismatch for {:?} (expected {})",
+                cand, expected
+            );
+        }
+    }
+
+    async fn selective_value_triple_exists_body(store: Store) {
         use tdb_succinct::TdbDataType;
 
-        let store = open_memory_store();
         let db = store.create("g").await.unwrap();
 
         let vs = |s: &str, p: &str, o: &str| ValueTriple::new_string_value(s, p, o);

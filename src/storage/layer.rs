@@ -85,6 +85,14 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         Ok(())
     }
 
+    /// A block source for driving block-lazy dictionaries, if this store's
+    /// backend supports ranged structure reads. Default `None` (whole-structure
+    /// backends fall back to loading full dictionaries).
+    #[cfg(feature = "object-store")]
+    fn block_source(&self) -> Option<std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>> {
+        None
+    }
+
     async fn get_layer_parent_name(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>>;
 
     async fn get_node_dictionary(&self, name: [u32; 5]) -> io::Result<Option<StringDict>>;
@@ -368,6 +376,13 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
 
     async fn finalize(&self, _directory: [u32; 5]) -> io::Result<()> {
         Ok(())
+    }
+
+    /// A block source for driving block-lazy dictionaries. Default `None`;
+    /// overridden by `ArchiveLayerStore` to hand out its ranged-read backends.
+    #[cfg(feature = "object-store")]
+    fn block_source(&self) -> Option<std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>> {
+        None
     }
 
     /// Prefetch the given layer archives concurrently into whatever cache the
@@ -1445,6 +1460,11 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
 {
     async fn layers(&self) -> io::Result<Vec<[u32; 5]>> {
         self.directories().await
+    }
+
+    #[cfg(feature = "object-store")]
+    fn block_source(&self) -> Option<std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>> {
+        PersistentLayerStore::block_source(self)
     }
 
     async fn get_layer_with_cache(

@@ -612,6 +612,32 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
                 .await
         }
     }
+    async fn get_layer_structure_range(
+        &self,
+        id: [u32; 5],
+        file_type: LayerFileEnum,
+        range: std::ops::Range<usize>,
+    ) -> io::Result<Bytes> {
+        // If the whole layer is cached, slice from the resident bytes (no extra
+        // transfer). Otherwise delegate to the data origin's true ranged read
+        // rather than the trait default, which would fetch the whole structure
+        // and slice — defeating block-lazy reads through this cache tier.
+        if self.layer_fits_in_cache(id).await? {
+            let whole = self
+                .get_layer_structure_bytes(id, file_type)
+                .await?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "structure not found in archive")
+                })?;
+            let end = range.end.min(whole.len());
+            let start = range.start.min(end);
+            Ok(whole.slice(start..end))
+        } else {
+            self.data_origin
+                .get_layer_structure_range(id, file_type, range)
+                .await
+        }
+    }
     async fn store_layer_file(&self, id: [u32; 5], bytes: Bytes) -> io::Result<()> {
         self.data_origin.store_layer_file(id, bytes.clone()).await?;
 
@@ -1499,11 +1525,53 @@ impl<M, D> ArchiveLayerStore<M, D> {
 
 const PREFIX_DIR_SIZE: usize = 3;
 
+// An `ArchiveLayerStore` can hand out a block source that reads the (small)
+// offset table and individual data blocks via its data backend and reports
+// structure sizes via its metadata backend — the seam `block_source` returns so
+// a `dyn LayerStore` can drive the block-lazy dictionary without exposing its
+// backend types. (Split across the two backends because the data backend need
+// not itself be an `ArchiveMetadataBackend`.)
+#[cfg(feature = "object-store")]
+#[async_trait]
+impl<M: ArchiveMetadataBackend + 'static, D: ArchiveBackend + 'static>
+    crate::storage::block_lazy::BlockSource for ArchiveLayerStore<M, D>
+{
+    async fn structure_bytes(
+        &self,
+        layer: [u32; 5],
+        file: LayerFileEnum,
+    ) -> io::Result<Option<Bytes>> {
+        self.data_backend
+            .get_layer_structure_bytes(layer, file)
+            .await
+    }
+    async fn structure_size(&self, layer: [u32; 5], file: LayerFileEnum) -> io::Result<usize> {
+        self.metadata_backend
+            .get_layer_structure_size(layer, file)
+            .await
+    }
+    async fn structure_range(
+        &self,
+        layer: [u32; 5],
+        file: LayerFileEnum,
+        range: std::ops::Range<usize>,
+    ) -> io::Result<Bytes> {
+        self.data_backend
+            .get_layer_structure_range(layer, file, range)
+            .await
+    }
+}
+
 #[async_trait]
 impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> PersistentLayerStore
     for ArchiveLayerStore<M, D>
 {
     type File = ArchiveLayerHandle<M, D>;
+
+    #[cfg(feature = "object-store")]
+    fn block_source(&self) -> Option<std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>> {
+        Some(std::sync::Arc::new(self.clone()))
+    }
 
     async fn directories(&self) -> io::Result<Vec<[u32; 5]>> {
         let mut result = self.metadata_backend.get_layer_names().await?;

@@ -113,6 +113,11 @@ impl LayerStore for CachedLayerStore {
         self.inner.layers().await
     }
 
+    #[cfg(feature = "object-store")]
+    fn block_source(&self) -> Option<std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>> {
+        self.inner.block_source()
+    }
+
     async fn get_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<InternalLayer>>> {
         self.inner
             .get_layer_with_cache(name, self.cache.clone())
