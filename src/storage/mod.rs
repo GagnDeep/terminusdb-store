@@ -34,6 +34,8 @@ mod copy;
 pub mod delta;
 mod locking;
 pub mod memory;
+#[cfg(feature = "object-store")]
+pub mod object;
 pub mod pack;
 
 pub use cache::*;
@@ -41,4 +43,6 @@ pub use delta::*;
 pub use file::*;
 pub use label::*;
 pub use layer::*;
+#[cfg(feature = "object-store")]
+pub use object::*;
 pub use pack::*;
