@@ -1672,6 +1672,69 @@ impl Store {
         })
     }
 
+    /// The global id of a subject string, resolved disk-lessly. Mirrors
+    /// `Layer::subject_id`. (Phase 3, Stage 4: forward resolution, public.)
+    pub async fn selective_subject_id(
+        &self,
+        head: [u32; 5],
+        subject: &str,
+    ) -> io::Result<Option<u64>> {
+        let (chain, off_nv, _, _, _) = self.chain_offsets(head).await?;
+        self.resolve_dict_id(&chain, &off_nv, DictKind::Node, subject)
+            .await
+    }
+
+    /// The global id of a predicate string. Mirrors `Layer::predicate_id`.
+    pub async fn selective_predicate_id(
+        &self,
+        head: [u32; 5],
+        predicate: &str,
+    ) -> io::Result<Option<u64>> {
+        let (chain, _, _, off_pred, _) = self.chain_offsets(head).await?;
+        self.resolve_dict_id(&chain, &off_pred, DictKind::Predicate, predicate)
+            .await
+    }
+
+    /// The global id of a triple object (node or typed value). Mirrors
+    /// `Layer::object_node_id` / `object_value_id`.
+    pub async fn selective_object_id(
+        &self,
+        head: [u32; 5],
+        object: &ObjectType,
+    ) -> io::Result<Option<u64>> {
+        let (chain, off_nv, _, _, _) = self.chain_offsets(head).await?;
+        self.resolve_object_id(&chain, &off_nv, object).await
+    }
+
+    /// Resolve a whole string triple to ids, disk-lessly (the three components
+    /// concurrently). Mirrors `Layer::value_triple_to_id`.
+    pub async fn selective_value_triple_to_id(
+        &self,
+        head: [u32; 5],
+        triple: &ValueTriple,
+    ) -> io::Result<Option<IdTriple>> {
+        let (chain, off_nv, _, off_pred, _) = self.chain_offsets(head).await?;
+        let (s, p, o) = futures::try_join!(
+            self.resolve_dict_id(&chain, &off_nv, DictKind::Node, &triple.subject),
+            self.resolve_dict_id(&chain, &off_pred, DictKind::Predicate, &triple.predicate),
+            self.resolve_object_id(&chain, &off_nv, &triple.object),
+        )?;
+        Ok(match (s, p, o) {
+            (Some(s), Some(p), Some(o)) => Some(IdTriple::new(s, p, o)),
+            _ => None,
+        })
+    }
+
+    /// A disk-less query handle over the graph headed by `head`: the common
+    /// read operations without ever materializing a whole layer. See
+    /// [`LazyLayer`].
+    pub fn lazy_layer(&self, head: [u32; 5]) -> LazyLayer {
+        LazyLayer {
+            store: self.clone(),
+            head,
+        }
+    }
+
     /// Resolve a triple object (node or typed value) to its global id, walking
     /// the chain head-first. See [`resolve_dict_id`](Self::resolve_dict_id) and
     /// [`resolve_value_local_id`](Self::resolve_value_local_id).
@@ -1879,6 +1942,115 @@ impl Store {
     /// Invalidate a specific layer from the cache, forcing reload from disk on next access.
     pub fn invalidate_layer(&self, name: [u32; 5]) {
         self.layer_store.invalidate(name);
+    }
+}
+
+/// A disk-less, async query handle over the graph headed by one layer.
+///
+/// It answers the common read operations -- existence, traversal, and
+/// string/id resolution in both directions -- by routing through the selective,
+/// block-lazy primitives on [`Store`], **without ever materializing a whole
+/// layer**. On an object-store backend with no local disk it fetches only the
+/// blocks a query touches; on other backends it falls back to whole structures.
+/// It is the disk-less analogue of a materialized [`StoreLayer`] for the
+/// point/traversal query classes.
+///
+/// Obtain one with [`Store::lazy_layer`]. Every method mirrors the like-named
+/// method on the [`Layer`](crate::layer::Layer) trait, made asynchronous.
+#[derive(Clone)]
+pub struct LazyLayer {
+    store: Store,
+    head: [u32; 5],
+}
+
+impl LazyLayer {
+    /// The head layer id this handle reads.
+    pub fn name(&self) -> [u32; 5] {
+        self.head
+    }
+
+    // ---- existence ----
+    pub async fn triple_exists(
+        &self,
+        subject: u64,
+        predicate: u64,
+        object: u64,
+    ) -> io::Result<bool> {
+        self.store
+            .selective_id_triple_exists(self.head, IdTriple::new(subject, predicate, object))
+            .await
+    }
+    pub async fn id_triple_exists(&self, triple: IdTriple) -> io::Result<bool> {
+        self.store
+            .selective_id_triple_exists(self.head, triple)
+            .await
+    }
+    pub async fn value_triple_exists(&self, triple: &ValueTriple) -> io::Result<bool> {
+        self.store
+            .selective_value_triple_exists(self.head, triple)
+            .await
+    }
+
+    // ---- traversal ----
+    pub async fn triples_s(&self, subject: u64) -> io::Result<Vec<IdTriple>> {
+        self.store.selective_id_triples_s(self.head, subject).await
+    }
+    pub async fn triples_sp(&self, subject: u64, predicate: u64) -> io::Result<Vec<IdTriple>> {
+        self.store
+            .selective_id_triples_sp(self.head, subject, predicate)
+            .await
+    }
+    pub async fn triples_p(&self, predicate: u64) -> io::Result<Vec<IdTriple>> {
+        self.store
+            .selective_id_triples_p(self.head, predicate)
+            .await
+    }
+    pub async fn triples_o(&self, object: u64) -> io::Result<Vec<IdTriple>> {
+        self.store.selective_id_triples_o(self.head, object).await
+    }
+
+    // ---- forward resolution (string -> id) ----
+    pub async fn subject_id(&self, subject: &str) -> io::Result<Option<u64>> {
+        self.store.selective_subject_id(self.head, subject).await
+    }
+    pub async fn predicate_id(&self, predicate: &str) -> io::Result<Option<u64>> {
+        self.store
+            .selective_predicate_id(self.head, predicate)
+            .await
+    }
+    pub async fn object_node_id(&self, object: &str) -> io::Result<Option<u64>> {
+        self.store
+            .selective_object_id(self.head, &ObjectType::Node(object.to_string()))
+            .await
+    }
+    pub async fn object_value_id(
+        &self,
+        object: &tdb_succinct::TypedDictEntry,
+    ) -> io::Result<Option<u64>> {
+        self.store
+            .selective_object_id(self.head, &ObjectType::Value(object.clone()))
+            .await
+    }
+    pub async fn value_triple_to_id(&self, triple: &ValueTriple) -> io::Result<Option<IdTriple>> {
+        self.store
+            .selective_value_triple_to_id(self.head, triple)
+            .await
+    }
+
+    // ---- reverse resolution (id -> string/value) ----
+    pub async fn id_subject(&self, id: u64) -> io::Result<Option<String>> {
+        self.store.selective_id_subject(self.head, id).await
+    }
+    pub async fn id_predicate(&self, id: u64) -> io::Result<Option<String>> {
+        self.store.selective_id_predicate(self.head, id).await
+    }
+    pub async fn id_object(&self, id: u64) -> io::Result<Option<ObjectType>> {
+        self.store.selective_id_object(self.head, id).await
+    }
+    pub async fn id_triple_to_string(&self, triple: IdTriple) -> io::Result<Option<ValueTriple>> {
+        self.store
+            .selective_id_triple_to_string(self.head, triple)
+            .await
     }
 }
 
@@ -2302,6 +2474,79 @@ mod tests {
                 cand, expected
             );
         }
+    }
+
+    // The LazyLayer facade must answer the common query operations exactly like
+    // the fully-materialized layer, disk-lessly.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn lazy_layer_facade_matches_full_layer() {
+        use tdb_succinct::TdbDataType;
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = open_object_store(bucket, "", 1 << 30);
+        let db = store.create("g").await.unwrap();
+
+        let vs = |s: &str, o: &str| ValueTriple::new_string_value(s, "p", o);
+        let vi = |s: &str, i: i32| {
+            ValueTriple::new_value(s, "age", <i32 as TdbDataType>::make_entry(&i))
+        };
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..700 {
+            builder
+                .add_value_triple(vs(&format!("n{:04}", i), &format!("s{:04}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vi(&format!("n{:04}", i), i))
+                .unwrap();
+        }
+        let layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+        let lazy = store.lazy_layer(head);
+        assert_eq!(head, lazy.name());
+
+        let present = vs("n0100", "s0100");
+        let present_i = vi("n0200", 200);
+        let absent = vs("n0100", "s0101");
+
+        // existence + forward resolution
+        assert!(lazy.value_triple_exists(&present).await.unwrap());
+        assert!(lazy.value_triple_exists(&present_i).await.unwrap());
+        assert!(!lazy.value_triple_exists(&absent).await.unwrap());
+        assert_eq!(
+            full.value_triple_to_id(&present),
+            lazy.value_triple_to_id(&present).await.unwrap()
+        );
+        assert_eq!(
+            full.subject_id("n0100"),
+            lazy.subject_id("n0100").await.unwrap()
+        );
+        assert_eq!(
+            full.predicate_id("p"),
+            lazy.predicate_id("p").await.unwrap()
+        );
+
+        // traversal + reverse resolution, cross-checked against the full layer
+        let sid = lazy.subject_id("n0100").await.unwrap().unwrap();
+        let mut lazy_s = lazy.triples_s(sid).await.unwrap();
+        let mut full_s: Vec<IdTriple> = full.triples_s(sid).collect();
+        lazy_s.sort();
+        full_s.sort();
+        assert_eq!(full_s, lazy_s);
+        for t in &full_s {
+            assert!(lazy
+                .triple_exists(t.subject, t.predicate, t.object)
+                .await
+                .unwrap());
+            assert_eq!(
+                full.id_triple_to_string(t),
+                lazy.id_triple_to_string(*t).await.unwrap()
+            );
+        }
+        assert_eq!(full.id_subject(sid), lazy.id_subject(sid).await.unwrap());
     }
 
     // Reverse (id -> string) resolution must match the fully-materialized layer.
