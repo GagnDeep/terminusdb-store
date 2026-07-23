@@ -447,6 +447,106 @@ impl BlockLazyTypedDict {
     }
 }
 
+/// A block-lazy reader for a `LogArray` — random access to a single bit-packed
+/// element without loading the whole array. An adjacency list's `nums` array is
+/// the largest structure a selective existence walk touches, yet each lookup
+/// reads only a handful of elements; this fetches just the one or two 64-bit
+/// words each element spans (via a ranged read), keeping only the control word
+/// (length + bit width) resident.
+pub struct BlockLazyLogArray {
+    source: Arc<dyn BlockSource>,
+    layer: [u32; 5],
+    file: LayerFileEnum,
+    len: u64,
+    width: u8,
+    /// Byte length of the structure (data words followed by the 8-byte control
+    /// word).
+    data_len: usize,
+    /// Cache of fetched 64-bit words keyed by their byte offset, so a scan over
+    /// consecutive elements re-reads a shared word at most once.
+    word_cache: Mutex<LruCache<usize, [u8; 8]>>,
+}
+
+impl BlockLazyLogArray {
+    /// Open a block-lazy view over a `LogArray` structure, reading only its
+    /// 8-byte control word (which encodes length and element bit width).
+    pub async fn open(
+        source: Arc<dyn BlockSource>,
+        layer: [u32; 5],
+        file: LayerFileEnum,
+    ) -> io::Result<Self> {
+        let data_len = source.structure_size(layer, file).await.unwrap_or(0);
+        let (len, width) = if data_len >= 8 {
+            let cw = source
+                .structure_range(layer, file, data_len - 8..data_len)
+                .await?;
+            tdb_succinct::parse_control_word(&cw[..])
+        } else {
+            (0, 0)
+        };
+        Ok(Self {
+            source,
+            layer,
+            file,
+            len,
+            width,
+            data_len,
+            word_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
+        })
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The 64-bit big-endian word at `byte_index` (zero-padded if the structure
+    /// ends early, which a valid element never relies on), via a cached ranged
+    /// read.
+    async fn word_at(&self, byte_index: usize) -> io::Result<u64> {
+        if let Some(w) = self.word_cache.lock().unwrap().get(&byte_index) {
+            return Ok(u64::from_be_bytes(*w));
+        }
+        let end = (byte_index + 8).min(self.data_len);
+        let mut w = [0u8; 8];
+        if byte_index < end {
+            let bytes = self
+                .source
+                .structure_range(self.layer, self.file, byte_index..end)
+                .await?;
+            let n = bytes.len().min(8);
+            w[..n].copy_from_slice(&bytes[..n]);
+        }
+        self.word_cache.lock().unwrap().put(byte_index, w);
+        Ok(u64::from_be_bytes(w))
+    }
+
+    /// The element at `index` — the exact decoding `LogArray::entry` performs,
+    /// but fetching only the word(s) it spans.
+    pub async fn entry(&self, index: usize) -> io::Result<u64> {
+        if self.width == 0 {
+            return Ok(0);
+        }
+        let bit_index = (self.width as usize) * index;
+        let byte_index = (bit_index >> 6) << 3;
+        let offset = (bit_index & 0b11_1111) as u8;
+        let leading_zeros = 64 - self.width;
+        let first_word = self.word_at(byte_index).await?;
+        if offset + self.width <= 64 {
+            return Ok(first_word << offset >> leading_zeros);
+        }
+        let second_word = self.word_at(byte_index + 8).await?;
+        let first_width = 64 - offset;
+        let second_width = self.width - first_width;
+        let first_part = first_word << offset >> offset << second_width;
+        let second_part = second_word >> (64 - second_width);
+        Ok(first_part | second_part)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +718,54 @@ mod tests {
                 "absent id_of_entry mismatch for {:?}",
                 e.datatype()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn block_lazy_logarray_matches_full_logarray() {
+        use tdb_succinct::LogArray;
+
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let backend = ObjectArchiveBackend::new(bucket.clone(), "");
+        let store = ArchiveLayerStore::new(backend.clone(), backend.clone());
+
+        // A base layer whose sp_o adjacency `nums` LogArray has many entries of
+        // varying magnitude (ids up to a few thousand -> multi-word spans).
+        let mut builder = store.create_base_layer().await.unwrap();
+        let name = builder.name();
+        for i in 0..1000 {
+            for j in 0..3 {
+                builder.add_value_triple(ValueTriple::new_node(
+                    &format!("s{:04}", i),
+                    &format!("p{}", j),
+                    &format!("s{:04}", (i * 7 + j) % 1000),
+                ));
+            }
+        }
+        builder.commit_boxed().await.unwrap();
+        store.finalize_layer(name).await.unwrap();
+
+        // Oracle: the fully-parsed nums LogArray.
+        let bytes = backend
+            .get_layer_structure_bytes(name, LayerFileEnum::PosSpOAdjacencyListNums)
+            .await
+            .unwrap()
+            .unwrap();
+        let full = LogArray::parse(bytes).unwrap();
+        let n = full.len();
+        assert!(n > 100, "expected a sizeable nums array");
+
+        let lazy = BlockLazyLogArray::open(
+            Arc::new(backend) as Arc<dyn BlockSource>,
+            name,
+            LayerFileEnum::PosSpOAdjacencyListNums,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n as u64, lazy.len());
+
+        for i in 0..n {
+            assert_eq!(full.entry(i), lazy.entry(i).await.unwrap(), "entry {}", i);
         }
     }
 }
