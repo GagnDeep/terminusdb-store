@@ -8,14 +8,14 @@
 //! commit. Over object storage this cuts write amplification and label
 //! contention by the batch factor.
 //!
-//! **Durability contract.** A buffered commit is durable once [`flush`] returns
-//! (or an auto-flush fires on the op threshold). Between flushes, buffered ops
-//! live only in RAM — like a database transaction that has not yet committed. If
-//! you need per-commit durability, use the default unbuffered `NamedGraph` path
-//! (which fsyncs every commit), or flush after each commit. Buffering is
-//! therefore opt-in and audit labels should stay on the strict default. (A
-//! persistent write-ahead log giving per-commit durability *on buffered labels*
-//! is a planned enhancement.)
+//! **Durability contract.** Opened via [`open`](BufferedNamedGraph::open), a
+//! buffered commit is durable once [`flush`] returns (or an auto-flush fires) —
+//! between flushes the ops live only in RAM, like a transaction that has not yet
+//! committed. Opened via [`open_with_wal`](BufferedNamedGraph::open_with_wal),
+//! each op is written to a node-local write-ahead log before it is acknowledged,
+//! so with [`DurabilityMode::PerCommitFsync`] no acknowledged commit is lost on a
+//! crash: recovery replays the log's un-flushed ops onto the current head.
+//! Buffering is opt-in; audit labels stay on the strict default unbuffered path.
 //!
 //! **Concurrency.** A buffered graph assumes a single logical writer for its
 //! label (matching the label compare-and-swap model). If a foreign writer
@@ -25,6 +25,7 @@
 //! [`flush`]: BufferedNamedGraph::flush
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -32,6 +33,7 @@ use tokio::sync::Mutex;
 use crate::layer::overlay::{OverlayLayer, OverlayOp};
 use crate::layer::{Layer, ValueTriple};
 
+use super::wal::{DurabilityMode, FileWal, Wal, WalRecord};
 use super::Store;
 
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +63,7 @@ pub struct BufferedNamedGraph {
     store: Store,
     label: String,
     max_ops: usize,
+    wal: Option<Arc<dyn Wal>>,
     pending: Mutex<Pending>,
 }
 
@@ -68,7 +71,35 @@ impl BufferedNamedGraph {
     /// Open group-commit buffering for an existing label that already has a
     /// head. `max_ops` triggers an automatic flush once that many value-level
     /// operations have accumulated (0 disables auto-flush).
+    ///
+    /// No write-ahead log: buffered commits are durable on flush only. For
+    /// per-commit durability use [`open_with_wal`](Self::open_with_wal).
     pub async fn open(store: Store, label: &str, max_ops: usize) -> io::Result<Self> {
+        Self::open_inner(store, label, max_ops, None).await
+    }
+
+    /// Open with a write-ahead log at `wal_path`, giving per-commit durability
+    /// per `durability`. On open, the log is replayed and any un-flushed commits
+    /// are recovered onto the current head (already-flushed records are skipped
+    /// by base, so a batch that was flushed but not checkpointed is never
+    /// double-applied).
+    pub async fn open_with_wal(
+        store: Store,
+        label: &str,
+        max_ops: usize,
+        wal_path: impl Into<PathBuf>,
+        durability: DurabilityMode,
+    ) -> io::Result<Self> {
+        let wal: Arc<dyn Wal> = Arc::new(FileWal::open(wal_path, durability).await?);
+        Self::open_inner(store, label, max_ops, Some(wal)).await
+    }
+
+    async fn open_inner(
+        store: Store,
+        label: &str,
+        max_ops: usize,
+        wal: Option<Arc<dyn Wal>>,
+    ) -> io::Result<Self> {
         let head_name = store
             .label_store
             .get_label(label)
@@ -81,11 +112,33 @@ impl BufferedNamedGraph {
             .get_layer(head_name)
             .await?
             .ok_or_else(|| BufferedError::NoHead(label.to_string()))?;
-        let overlay = OverlayLayer::new(base as Arc<dyn Layer>);
+        let mut overlay = OverlayLayer::new(base as Arc<dyn Layer>);
+
+        // Crash recovery: replay the WAL, keep only records for the current head
+        // (others were already flushed), rewrite the log to just those, and
+        // re-apply them to the overlay.
+        if let Some(wal) = &wal {
+            let surviving: Vec<WalRecord> = wal
+                .replay()
+                .await?
+                .into_iter()
+                .filter(|r| r.base == head_name)
+                .collect();
+            wal.checkpoint().await?;
+            for record in &surviving {
+                wal.append(record).await?;
+                match &record.op {
+                    OverlayOp::Add(t) => overlay.add(t.clone()),
+                    OverlayOp::Remove(t) => overlay.remove(t.clone()),
+                }
+            }
+        }
+
         Ok(Self {
             store,
             label: label.to_string(),
             max_ops,
+            wal,
             pending: Mutex::new(Pending {
                 overlay,
                 base_name: head_name,
@@ -96,6 +149,14 @@ impl BufferedNamedGraph {
     /// Buffer a triple addition. Auto-flushes if the op threshold is reached.
     pub async fn add(&self, triple: ValueTriple) -> io::Result<()> {
         let mut p = self.pending.lock().await;
+        // durable before ack
+        if let Some(wal) = &self.wal {
+            wal.append(&WalRecord {
+                base: p.base_name,
+                op: OverlayOp::Add(triple.clone()),
+            })
+            .await?;
+        }
         p.overlay.add(triple);
         if self.max_ops != 0 && p.overlay.len() >= self.max_ops {
             self.flush_locked(&mut p).await?;
@@ -106,6 +167,13 @@ impl BufferedNamedGraph {
     /// Buffer a triple removal. Auto-flushes if the op threshold is reached.
     pub async fn remove(&self, triple: ValueTriple) -> io::Result<()> {
         let mut p = self.pending.lock().await;
+        if let Some(wal) = &self.wal {
+            wal.append(&WalRecord {
+                base: p.base_name,
+                op: OverlayOp::Remove(triple.clone()),
+            })
+            .await?;
+        }
         p.overlay.remove(triple);
         if self.max_ops != 0 && p.overlay.len() >= self.max_ops {
             self.flush_locked(&mut p).await?;
@@ -160,6 +228,13 @@ impl BufferedNamedGraph {
             .ok_or_else(|| BufferedError::NoSuchLabel(self.label.clone()))?;
         if !graph.set_head(&new_layer).await? {
             return Err(BufferedError::Conflict(self.label.clone()).into());
+        }
+
+        // The batch is now persisted and the label advanced, so the log can be
+        // discarded. (A crash between set_head and here leaves the old records,
+        // which recovery skips by base and rewrites away.)
+        if let Some(wal) = &self.wal {
+            wal.checkpoint().await?;
         }
 
         // Reset the overlay onto the freshly flushed head.
@@ -296,5 +371,63 @@ mod tests {
             .await
             .unwrap();
         assert!(buffered.flush().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn wal_recovers_unflushed_commits_without_double_apply() {
+        use crate::store::wal::DurabilityMode::PerCommitFsync;
+        use tempfile::tempdir;
+
+        let (store, label) = store_with_base().await;
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("g.wal");
+
+        // buffer two commits, then "crash" (drop without flushing)
+        {
+            let b = BufferedNamedGraph::open_with_wal(
+                store.clone(),
+                &label,
+                0,
+                &wal_path,
+                PerCommitFsync,
+            )
+            .await
+            .unwrap();
+            b.add(vt("x", "p", "1")).await.unwrap();
+            b.add(vt("y", "p", "2")).await.unwrap();
+            // the persisted label has NOT advanced
+        }
+
+        // reopen: the un-flushed commits are recovered from the WAL
+        let b =
+            BufferedNamedGraph::open_with_wal(store.clone(), &label, 0, &wal_path, PerCommitFsync)
+                .await
+                .unwrap();
+        assert_eq!(2, b.pending_ops().await);
+        let head = b.head().await;
+        assert!(head.value_triple_exists(&vt("x", "p", "1")));
+        assert!(head.value_triple_exists(&vt("y", "p", "2")));
+
+        // flush persists them and checkpoints the WAL
+        b.flush().await.unwrap().unwrap();
+        let persisted = store
+            .open(&label)
+            .await
+            .unwrap()
+            .unwrap()
+            .head()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(persisted.value_triple_exists(&vt("x", "p", "1")));
+        assert!(persisted.value_triple_exists(&vt("y", "p", "2")));
+
+        // reopening a third time recovers nothing — no double-apply of the
+        // already-flushed batch
+        let b3 =
+            BufferedNamedGraph::open_with_wal(store.clone(), &label, 0, &wal_path, PerCommitFsync)
+                .await
+                .unwrap();
+        assert_eq!(0, b3.pending_ops().await);
     }
 }

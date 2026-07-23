@@ -4,6 +4,7 @@
 pub mod buffered;
 pub mod compaction;
 pub mod sync;
+pub mod wal;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
