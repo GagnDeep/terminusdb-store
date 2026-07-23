@@ -19,7 +19,7 @@
 use std::io;
 
 use bytes::Bytes;
-use tdb_succinct::block::SizedDictBlock;
+use tdb_succinct::block::{IdLookupResult, SizedDictBlock};
 use tdb_succinct::{MonotonicLogArray, SizedDictEntry};
 
 use super::archive::{ArchiveBackend, ArchiveMetadataBackend};
@@ -96,6 +96,17 @@ impl<B: ArchiveBackend + ArchiveMetadataBackend> BlockLazyStringDict<B> {
         (start, end)
     }
 
+    /// Fetch and parse one data block via a ranged read.
+    async fn get_block(&self, block_index: usize) -> io::Result<SizedDictBlock> {
+        let (start, end) = self.block_range(block_index);
+        let mut bytes: Bytes = self
+            .backend
+            .get_layer_structure_range(self.layer, self.blocks_file, start..end)
+            .await?;
+        SizedDictBlock::parse(&mut bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("block: {:?}", e)))
+    }
+
     /// The dictionary entry for `id` (1-based), fetching only its block.
     pub async fn entry(&self, id: u64) -> io::Result<Option<SizedDictEntry>> {
         if id == 0 {
@@ -107,17 +118,47 @@ impl<B: ArchiveBackend + ArchiveMetadataBackend> BlockLazyStringDict<B> {
         if block_index >= self.num_blocks() {
             return Ok(None);
         }
-        let (start, end) = self.block_range(block_index);
-        let mut bytes: Bytes = self
-            .backend
-            .get_layer_structure_range(self.layer, self.blocks_file, start..end)
-            .await?;
-        let block = SizedDictBlock::parse(&mut bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("block: {:?}", e)))?;
+        let block = self.get_block(block_index).await?;
         if within >= block.num_entries() as usize {
             return Ok(None);
         }
         Ok(Some(block.entry(within)))
+    }
+
+    /// The id of a dictionary entry given its raw bytes, fetching only the
+    /// blocks the binary search touches (mirrors `SizedDict::id`).
+    pub async fn id(&self, slice: &[u8]) -> io::Result<IdLookupResult> {
+        let num_blocks = self.num_blocks();
+        if num_blocks == 0 {
+            return Ok(IdLookupResult::NotFound);
+        }
+        let mut min = 0usize;
+        let mut max = num_blocks - 1; // = offsets.len()
+        while min <= max {
+            let mid = (min + max) / 2;
+            let head = self.get_block(mid).await?.entry(0).to_bytes();
+            match slice.cmp(&head[..]) {
+                std::cmp::Ordering::Less => {
+                    if mid == 0 {
+                        return Ok(IdLookupResult::NotFound);
+                    }
+                    max = mid - 1;
+                }
+                std::cmp::Ordering::Greater => min = mid + 1,
+                std::cmp::Ordering::Equal => {
+                    return Ok(IdLookupResult::Found((mid * BLOCK_SIZE + 1) as u64))
+                }
+            }
+        }
+        let found = max;
+        let block = self.get_block(found).await?;
+        let offset = (found * BLOCK_SIZE) as u64 + 1;
+        Ok(block.id(slice).offset(offset).default(offset - 1))
+    }
+
+    /// The id of a string in this (string) dictionary, or `None` if absent.
+    pub async fn id_of_string(&self, s: &str) -> io::Result<Option<u64>> {
+        Ok(self.id(s.as_bytes()).await?.into_option())
     }
 
     /// The string for `id` (for a string dictionary), fetching only its block.
@@ -186,6 +227,28 @@ mod tests {
         // Out-of-range ids yield None.
         assert_eq!(None, lazy.get_string(0).await.unwrap());
         assert_eq!(None, lazy.get_string(n + 1).await.unwrap());
+
+        // string -> id matches the full dictionary, and round-trips.
+        for i in [0usize, 1, 7, 8, 42, 100, 255, 256, 499] {
+            let s = format!("node{:04}", i);
+            let sr: &str = &s;
+            let expected = full.id(&sr).into_option();
+            let got = lazy.id_of_string(&s).await.unwrap();
+            assert_eq!(expected, got, "id_of({})", s);
+            if let Some(id) = got {
+                assert_eq!(Some(s.clone()), lazy.get_string(id).await.unwrap());
+            }
+        }
+        // absent strings resolve to None, matching the full dictionary.
+        for s in ["node9999", "aaa", "zzzzzz"] {
+            let sr: &str = s;
+            assert_eq!(
+                full.id(&sr).into_option(),
+                lazy.id_of_string(s).await.unwrap(),
+                "absent {}",
+                s
+            );
+        }
 
         // A single lookup fetches one block, a small fraction of the whole
         // dictionary data — the disk-less win.
