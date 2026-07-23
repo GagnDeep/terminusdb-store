@@ -471,6 +471,36 @@ credentials pass through `object_store`'s option map
 
 ---
 
+## 8a. Milestone 4 benchmark: cold vs warm read
+
+Measured by `bench_cold_vs_warm` (an `#[ignore]`d test in
+`src/storage/object_cache.rs`; run with
+`cargo test --features object-store -- --ignored --nocapture bench_cold_vs_warm`).
+A **12-layer** chain is read through the three-tier stack (in-memory LRU → local
+disk spill → origin). The origin is `object_store`'s in-memory store wrapped so
+every GET/HEAD sleeps a simulated **5 ms** round-trip — this isolates the
+latency term the network actually adds.
+
+| Scenario | Time | Notes |
+|---|---:|---|
+| **Cold** — empty object cache, empty LRU, empty disk | **380 ms** | ~76 sequential round-trips: per layer the walk does a parent GET, existence/size HEADs, structure-size, and the whole-layer GET, ×12 layers. This is the §8 "layer-stack depth" risk, quantified. |
+| **Warm (in-process object cache)** — second read, same store | **≈10 µs** | `LockingHashMapLayerCache` returns the `Arc<InternalLayer>` with zero I/O — ~40,000× faster. |
+| **Warm (local disk, cold metadata)** — fresh LRU/object cache over a populated disk dir | **298 ms** | Layer *bytes* are served from local disk (0 origin data GETs), but the parent-walk's metadata **HEADs still hit the origin**, so a latency-bound deep walk is only ~20 % faster. Disk-tier stats for the cold read: **0 hits / 12 misses, 6976 bytes fetched**. |
+
+Reading of the numbers:
+
+- The in-process object cache is the dominant warm-path win and is already wired
+  by `open_object_store`.
+- The disk spill tier saves **bandwidth** (no repeated whole-archive transfers)
+  and makes a cold replica self-warming, but it does **not** by itself fix
+  **latency** on a deep ancestor walk, because metadata round-trips remain
+  sequential. That is exactly what motivates the §8 note on parallelising
+  ancestor fetches (future work) and the rollup/squash machinery (keep stacks
+  shallow). The benchmark is intentionally honest about this rather than hiding
+  it behind an all-in-memory measurement.
+
+---
+
 ## 9. Verification posture (all milestones)
 
 `cargo test`, `cargo clippy --all-targets`, `cargo fmt --check` must pass with the
