@@ -1107,12 +1107,36 @@ impl Store {
         Ok(reconcile_layered(per_layer))
     }
 
-    // NB: an object-direction `selective_id_triples_o` is deliberately omitted
-    // for now. Unlike subjects and predicates, whose ids are stable across the
-    // chain, the object index (o_ps) is renumbered per layer, so a head-level
-    // global object id must be mapped to each layer's local object index before
-    // querying. That per-layer mapping is a follow-up; the subject/predicate
-    // directions above cover the common traversal patterns.
+    /// All id-triples with object `object`.
+    ///
+    /// The per-layer object iterator seeks to the *nearest* object when the
+    /// queried one is absent from a layer, and the cached path does not apply
+    /// the exact-match filter the file path does, so we filter to the exact
+    /// object here before reconciling.
+    pub async fn selective_id_triples_o(
+        &self,
+        head: [u32; 5],
+        object: u64,
+    ) -> io::Result<Vec<IdTriple>> {
+        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let mut per_layer = Vec::with_capacity(chain.len());
+        for &layer in chain.iter().rev() {
+            let adds: Vec<IdTriple> = self
+                .layer_store
+                .triple_additions_o(layer, object)
+                .await?
+                .filter(|t| t.object == object)
+                .collect();
+            let removes: Vec<IdTriple> = self
+                .layer_store
+                .triple_removals_o(layer, object)
+                .await?
+                .filter(|t| t.object == object)
+                .collect();
+            per_layer.push((adds, removes));
+        }
+        Ok(reconcile_layered(per_layer))
+    }
 
     /// Spawn a background task that keeps read depth bounded: every `interval`
     /// it rolls up (non-destructively) any label head whose effective layer
@@ -1564,6 +1588,7 @@ mod tests {
         let all: Vec<IdTriple> = full.triples().collect();
         let subjects: HashSet<u64> = all.iter().map(|t| t.subject).collect();
         let predicates: HashSet<u64> = all.iter().map(|t| t.predicate).collect();
+        let objects: HashSet<u64> = all.iter().map(|t| t.object).collect();
 
         let sorted = |it: Box<dyn Iterator<Item = IdTriple> + Send>| {
             let mut v: Vec<IdTriple> = it.collect();
@@ -1586,6 +1611,14 @@ mod tests {
                 store.selective_id_triples_p(head, p).await.unwrap(),
                 "triples_p({})",
                 p
+            );
+        }
+        for &o in &objects {
+            assert_eq!(
+                sorted(full.triples_o(o)),
+                store.selective_id_triples_o(head, o).await.unwrap(),
+                "triples_o({})",
+                o
             );
         }
         for t in all.iter().take(25) {
