@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lru::LruCache;
 use tdb_succinct::block::{IdLookupResult, SizedDictBlock};
-use tdb_succinct::{MonotonicLogArray, SizedDictEntry};
+use tdb_succinct::{MonotonicLogArray, SizedDictEntry, TypedDictEntry};
 
 use super::archive::{ArchiveBackend, ArchiveMetadataBackend};
 use super::consts::LayerFileEnum;
@@ -236,6 +236,217 @@ impl BlockLazyStringDict {
     }
 }
 
+/// A block-lazy reader for a layer's **typed value** dictionary (`TypedDict`).
+///
+/// A value dictionary groups its entries into per-datatype segments over one
+/// shared block-data structure. This keeps the three small index logarrays
+/// resident (`types_present`, `type_offsets`, `block_offsets`) and the per-type
+/// id offsets, then fetches only the O(log n) blocks a lookup touches — mirroring
+/// `TypedDict::id_slice` (find the datatype's segment, binary-search its blocks).
+///
+/// Only the `value -> id` direction is implemented (all the selective existence
+/// path needs); the reverse (`id -> value`) still uses the whole dictionary.
+///
+/// A datatype segment's block `k` is exactly the global block `seg_start + k`,
+/// so block byte ranges are computed from the global `block_offsets` and the
+/// data length — the same shape as [`BlockLazyStringDict`].
+pub struct BlockLazyTypedDict {
+    source: Arc<dyn BlockSource>,
+    layer: [u32; 5],
+    blocks_file: LayerFileEnum,
+    types_present: MonotonicLogArray,
+    type_offsets: MonotonicLogArray,
+    block_offsets: MonotonicLogArray,
+    /// Cumulative id offset for the start of each datatype segment (mirrors
+    /// `TypedDict::type_id_offsets`); `type_id_offsets[i-1]` is segment `i`'s.
+    type_id_offsets: Vec<u64>,
+    /// Length of the block data, excluding the 8 trailing bytes `TypedDict`
+    /// strips (`data.slice(..len - 8)`).
+    data_len: usize,
+    block_cache: Mutex<LruCache<usize, Bytes>>,
+}
+
+impl BlockLazyTypedDict {
+    /// Open a block-lazy view over a value dictionary from its four structures.
+    /// Loads only the three small index logarrays (and, for multi-datatype
+    /// dictionaries, one control byte per datatype boundary) — never the blocks.
+    pub async fn open(
+        source: Arc<dyn BlockSource>,
+        layer: [u32; 5],
+        types_present_file: LayerFileEnum,
+        type_offsets_file: LayerFileEnum,
+        block_offsets_file: LayerFileEnum,
+        blocks_file: LayerFileEnum,
+    ) -> io::Result<Self> {
+        async fn logarray(
+            source: &Arc<dyn BlockSource>,
+            layer: [u32; 5],
+            file: LayerFileEnum,
+        ) -> io::Result<MonotonicLogArray> {
+            // Value-dict index structures are always present (an empty logarray
+            // is still an 8-byte control word), so absence is an error rather
+            // than a silently-empty array. `open` is only called on non-empty
+            // value dictionaries (guarded by the entry count at the call site).
+            let bytes = source
+                .structure_bytes(layer, file)
+                .await?
+                .filter(|b| !b.is_empty())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "value dict structure missing")
+                })?;
+            MonotonicLogArray::parse(bytes).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("logarray: {:?}", e))
+            })
+        }
+        let types_present = logarray(&source, layer, types_present_file).await?;
+        let type_offsets = logarray(&source, layer, type_offsets_file).await?;
+        let block_offsets = logarray(&source, layer, block_offsets_file).await?;
+        let raw_len = source.structure_size(layer, blocks_file).await.unwrap_or(0);
+        // `TypedDict` stores its block data as `data.slice(..len - 8)`.
+        let data_len = raw_len.saturating_sub(8);
+
+        // Compute per-segment id offsets exactly as `TypedDict::from_parts`:
+        // each needs the control byte at the datatype boundary in the data.
+        let mut type_id_offsets = Vec::new();
+        if !types_present.is_empty() {
+            let mut tally: u64 = 0;
+            for type_offset in type_offsets.iter() {
+                let boundary = if type_offset == 0 {
+                    0
+                } else {
+                    block_offsets.entry(type_offset as usize - 1) as usize
+                };
+                let cw = source
+                    .structure_range(layer, blocks_file, boundary..boundary + 1)
+                    .await?;
+                let last_block_len = tdb_succinct::block::parse_block_control_records(cw[0]);
+                let gap = BLOCK_SIZE as u8 - last_block_len;
+                tally += gap as u64;
+                type_id_offsets.push((type_offset + 1) * 8 - tally);
+            }
+        }
+
+        Ok(Self {
+            source,
+            layer,
+            blocks_file,
+            types_present,
+            type_offsets,
+            block_offsets,
+            type_id_offsets,
+            data_len,
+            block_cache: Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
+        })
+    }
+
+    /// Byte range of global block `g` in the data structure.
+    fn global_block_range(&self, g: usize) -> (usize, usize) {
+        let start = if g == 0 {
+            0
+        } else {
+            self.block_offsets.entry(g - 1) as usize
+        };
+        let end = if g < self.block_offsets.len() {
+            self.block_offsets.entry(g) as usize
+        } else {
+            self.data_len
+        };
+        (start, end)
+    }
+
+    async fn get_block(&self, g: usize) -> io::Result<SizedDictBlock> {
+        let cached = self.block_cache.lock().unwrap().get(&g).cloned();
+        let mut bytes: Bytes = match cached {
+            Some(b) => b,
+            None => {
+                let (start, end) = self.global_block_range(g);
+                let fetched = self
+                    .source
+                    .structure_range(self.layer, self.blocks_file, start..end)
+                    .await?;
+                self.block_cache.lock().unwrap().put(g, fetched.clone());
+                fetched
+            }
+        };
+        SizedDictBlock::parse(&mut bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("block: {:?}", e)))
+    }
+
+    /// The datatype segment for type index `i`: its first global block index,
+    /// its block count, and its id offset (mirrors `TypedDict::inner_type_segment`).
+    fn segment(&self, i: usize) -> (usize, usize, u64) {
+        let (type_offset, id_offset) = if i == 0 {
+            (0usize, 0u64)
+        } else {
+            (
+                self.type_offsets.entry(i - 1) as usize,
+                self.type_id_offsets[i - 1],
+            )
+        };
+        let len = if i == self.types_present.len() - 1 {
+            if i == 0 {
+                self.block_offsets.len() - type_offset
+            } else {
+                self.block_offsets.len() - type_offset - 1
+            }
+        } else {
+            let next_offset = self.type_offsets.entry(i) as usize;
+            if i == 0 {
+                next_offset - type_offset
+            } else {
+                next_offset - type_offset - 1
+            }
+        };
+        let seg_start = if i == 0 { 0 } else { type_offset + 1 };
+        (seg_start, len + 1, id_offset)
+    }
+
+    /// The value-dictionary-local id of a typed entry, or `None` if absent —
+    /// the same value as `TypedDict::id_entry(..).into_option()`.
+    pub async fn id_of_entry(&self, entry: &TypedDictEntry) -> io::Result<Option<u64>> {
+        let dt = entry.datatype();
+        let i = match self.types_present.index_of(dt as u64) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let (seg_start, num_blocks, id_offset) = self.segment(i);
+        if num_blocks == 0 {
+            return Ok(None);
+        }
+        let slice = entry.to_bytes();
+        let slice = &slice[..];
+
+        // Binary search over the segment's blocks (mirrors `SizedDict::id`),
+        // block `k` = global block `seg_start + k`.
+        let mut min = 0usize;
+        let mut max = num_blocks - 1;
+        let seg_result: IdLookupResult = loop {
+            if min > max {
+                let found = max;
+                let block = self.get_block(seg_start + found).await?;
+                let offset = (found * BLOCK_SIZE) as u64 + 1;
+                break block.id(slice).offset(offset).default(offset - 1);
+            }
+            let mid = (min + max) / 2;
+            let head = self.get_block(seg_start + mid).await?.entry(0).to_bytes();
+            match slice.cmp(&head[..]) {
+                std::cmp::Ordering::Less => {
+                    if mid == 0 {
+                        break IdLookupResult::NotFound;
+                    }
+                    max = mid - 1;
+                }
+                std::cmp::Ordering::Greater => min = mid + 1,
+                std::cmp::Ordering::Equal => {
+                    break IdLookupResult::Found((mid * BLOCK_SIZE + 1) as u64)
+                }
+            }
+        };
+        // Compose with the segment's id offset, as `TypedDict::id_slice` does.
+        Ok(seg_result.offset(id_offset).into_option())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +536,88 @@ mod tests {
             e - s,
             lazy.data_len
         );
+    }
+
+    #[tokio::test]
+    async fn block_lazy_typed_dict_matches_full_dictionary() {
+        use tdb_succinct::TdbDataType;
+
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let backend = ObjectArchiveBackend::new(bucket.clone(), "");
+        let store = ArchiveLayerStore::new(backend.clone(), backend.clone());
+
+        // A base layer whose value dictionary spans several datatypes, each with
+        // enough entries to fill multiple blocks (so segments and block-lazy
+        // binary search are genuinely exercised).
+        let mut builder = store.create_base_layer().await.unwrap();
+        let name = builder.name();
+        for i in 0..400 {
+            // string values
+            builder.add_value_triple(ValueTriple::new_string_value(
+                &format!("s{:04}", i),
+                "p",
+                &format!("val{:04}", i),
+            ));
+            // i32 typed values
+            builder.add_value_triple(ValueTriple::new_value(
+                &format!("s{:04}", i),
+                "n",
+                <i32 as TdbDataType>::make_entry(&(i as i32)),
+            ));
+            // f64 typed values
+            builder.add_value_triple(ValueTriple::new_value(
+                &format!("s{:04}", i),
+                "f",
+                <f64 as TdbDataType>::make_entry(&(i as f64 * 1.5)),
+            ));
+        }
+        builder.commit_boxed().await.unwrap();
+        store.finalize_layer(name).await.unwrap();
+
+        // Oracle: the fully-loaded typed value dictionary.
+        let full = store.get_value_dictionary(name).await.unwrap().unwrap();
+
+        let lazy = BlockLazyTypedDict::open(
+            Arc::new(backend) as Arc<dyn BlockSource>,
+            name,
+            LayerFileEnum::ValueDictionaryTypesPresent,
+            LayerFileEnum::ValueDictionaryTypeOffsets,
+            LayerFileEnum::ValueDictionaryOffsets,
+            LayerFileEnum::ValueDictionaryBlocks,
+        )
+        .await
+        .unwrap();
+
+        // Present entries across all three datatypes resolve to the same id.
+        let mut entries: Vec<TypedDictEntry> = Vec::new();
+        for i in [0usize, 1, 7, 8, 42, 100, 255, 256, 399] {
+            entries.push(<i32 as TdbDataType>::make_entry(&(i as i32)));
+            entries.push(<f64 as TdbDataType>::make_entry(&(i as f64 * 1.5)));
+            entries.push(<String as TdbDataType>::make_entry(&format!("val{:04}", i)));
+        }
+        for e in &entries {
+            assert_eq!(
+                full.id_entry(e).into_option(),
+                lazy.id_of_entry(e).await.unwrap(),
+                "id_of_entry mismatch for {:?}",
+                e.datatype()
+            );
+        }
+        // Absent entries (including a datatype-present-but-value-absent case and
+        // a value of a datatype not in the dictionary) resolve to None, matching.
+        let absents = [
+            <i32 as TdbDataType>::make_entry(&999_999),
+            <f64 as TdbDataType>::make_entry(&-1.0),
+            <String as TdbDataType>::make_entry(&"nope".to_string()),
+            <bool as TdbDataType>::make_entry(&true),
+        ];
+        for e in &absents {
+            assert_eq!(
+                full.id_entry(e).into_option(),
+                lazy.id_of_entry(e).await.unwrap(),
+                "absent id_of_entry mismatch for {:?}",
+                e.datatype()
+            );
+        }
     }
 }

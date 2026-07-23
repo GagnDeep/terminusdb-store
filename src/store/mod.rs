@@ -1049,6 +1049,44 @@ impl Store {
         Ok(None)
     }
 
+    /// Resolve a typed value to its value-dictionary-local id in `layer` (the id
+    /// before the `+ node_dict_len` shift and id-map). Uses a block-lazy
+    /// [`BlockLazyTypedDict`] when the backend supports ranged reads and the
+    /// value dictionary is large enough to win; otherwise loads the whole value
+    /// dictionary. Both yield the same id as `TypedDict::id_entry`.
+    ///
+    /// [`BlockLazyTypedDict`]: crate::storage::block_lazy::BlockLazyTypedDict
+    async fn resolve_value_local_id(
+        &self,
+        layer: [u32; 5],
+        v: &tdb_succinct::TypedDictEntry,
+    ) -> io::Result<Option<u64>> {
+        let ls = &self.layer_store;
+        #[cfg(feature = "object-store")]
+        {
+            let count = ls.get_value_count(layer).await?.unwrap_or(0);
+            if count >= BLOCK_LAZY_MIN_ENTRIES {
+                if let Some(src) = ls.block_source() {
+                    use crate::storage::consts::LayerFileEnum;
+                    let d = crate::storage::block_lazy::BlockLazyTypedDict::open(
+                        src,
+                        layer,
+                        LayerFileEnum::ValueDictionaryTypesPresent,
+                        LayerFileEnum::ValueDictionaryTypeOffsets,
+                        LayerFileEnum::ValueDictionaryOffsets,
+                        LayerFileEnum::ValueDictionaryBlocks,
+                    )
+                    .await?;
+                    return d.id_of_entry(v).await;
+                }
+            }
+        }
+        Ok(ls
+            .get_value_dictionary(layer)
+            .await?
+            .and_then(|vd| vd.id_entry(v).into_option()))
+    }
+
     /// Like [`selective_id_triple_exists`](Self::selective_id_triple_exists) but
     /// for a *string* triple: resolves the subject/predicate/object to ids by
     /// loading only the dictionaries and id-maps of the layers in the chain
@@ -1117,19 +1155,17 @@ impl Store {
                 let v: &TypedDictEntry = v;
                 let mut found = None;
                 for i in (0..chain.len()).rev() {
-                    if let Some(vdict) = ls.get_value_dictionary(chain[i]).await? {
-                        if let Some(local) = vdict.id_entry(v).into_option() {
-                            // values live above this layer's nodes in the id-map's
-                            // input space, hence the `+ node_dict_len` shift.
-                            let node_len = ls.get_node_count(chain[i]).await?.unwrap_or(0);
-                            let combined = local + node_len;
-                            let outer = match ls.get_node_value_idmap(chain[i]).await? {
-                                Some(m) => m.inner_to_outer(combined),
-                                None => combined,
-                            };
-                            found = Some(outer + off_nv[i]);
-                            break;
-                        }
+                    if let Some(local) = self.resolve_value_local_id(chain[i], v).await? {
+                        // values live above this layer's nodes in the id-map's
+                        // input space, hence the `+ node_dict_len` shift.
+                        let node_len = ls.get_node_count(chain[i]).await?.unwrap_or(0);
+                        let combined = local + node_len;
+                        let outer = match ls.get_node_value_idmap(chain[i]).await? {
+                            Some(m) => m.inner_to_outer(combined),
+                            None => combined,
+                        };
+                        found = Some(outer + off_nv[i]);
+                        break;
                     }
                 }
                 match found {
@@ -1625,6 +1661,71 @@ mod tests {
         candidates.push(vn("absentsubj", "pred00000", "subj00002")); // absent subject
         candidates.push(vn("subj00010", "absentpred", "subj00011")); // absent predicate
         candidates.push(vn("subj00010", "pred00010", "subj00099")); // resolvable, absent triple
+
+        for cand in &candidates {
+            let expected = full.value_triple_exists(cand);
+            let got = store
+                .selective_value_triple_exists(head, cand)
+                .await
+                .unwrap();
+            assert_eq!(
+                expected, got,
+                "mismatch for {:?} (expected {})",
+                cand, expected
+            );
+        }
+    }
+
+    // Differential check for the block-lazy typed value dictionary through the
+    // full selective pipeline: a value dictionary large enough (> threshold) and
+    // spanning multiple datatypes so BlockLazyTypedDict's per-segment binary
+    // search resolves value objects.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn selective_value_triple_exists_block_lazy_large_value_dict() {
+        use tdb_succinct::TdbDataType;
+
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = open_object_store(bucket, "", 1 << 30);
+        let db = store.create("g").await.unwrap();
+
+        let vs = |s: &str, o: &str| ValueTriple::new_string_value(s, "sp", o);
+        let vi =
+            |s: &str, i: i32| ValueTriple::new_value(s, "ip", <i32 as TdbDataType>::make_entry(&i));
+        let vf =
+            |s: &str, f: f64| ValueTriple::new_value(s, "fp", <f64 as TdbDataType>::make_entry(&f));
+
+        // > 512 entries per datatype so the value dict crosses the threshold and
+        // spans three segments.
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..600 {
+            builder
+                .add_value_triple(vs(&format!("s{:04}", i), &format!("str{:04}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vi(&format!("s{:04}", i), i))
+                .unwrap();
+            builder
+                .add_value_triple(vf(&format!("s{:04}", i), i as f64 * 0.25))
+                .unwrap();
+        }
+        let layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+
+        let mut candidates: Vec<ValueTriple> = Vec::new();
+        for i in (0..600).step_by(23) {
+            candidates.push(vs(&format!("s{:04}", i), &format!("str{:04}", i)));
+            candidates.push(vi(&format!("s{:04}", i), i));
+            candidates.push(vf(&format!("s{:04}", i), i as f64 * 0.25));
+        }
+        candidates.push(vs("s0000", "str0001")); // resolvable, absent triple
+        candidates.push(vi("s0000", 999_999)); // absent i32 value
+        candidates.push(vf("s0000", -1.0)); // absent f64 value
+        candidates.push(vs("absent", "str0000")); // absent subject
 
         for cand in &candidates {
             let expected = full.value_triple_exists(cand);
