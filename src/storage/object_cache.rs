@@ -349,6 +349,36 @@ mod tests {
     struct LatencyStore {
         inner: Arc<dyn ObjectStore>,
         delay: Duration,
+        larch: Arc<std::sync::atomic::AtomicUsize>,
+        rollup: Arc<std::sync::atomic::AtomicUsize>,
+        stack: Arc<std::sync::atomic::AtomicUsize>,
+        other: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LatencyStore {
+        fn new(inner: Arc<dyn ObjectStore>, delay: Duration) -> Self {
+            Self {
+                inner,
+                delay,
+                larch: Default::default(),
+                rollup: Default::default(),
+                stack: Default::default(),
+                other: Default::default(),
+            }
+        }
+        fn count(&self, location: &OsPath) {
+            use std::sync::atomic::Ordering::Relaxed;
+            let f = location.filename().unwrap_or("");
+            if f.ends_with(".rollup.hex") {
+                self.rollup.fetch_add(1, Relaxed);
+            } else if f.ends_with(".larch") {
+                self.larch.fetch_add(1, Relaxed);
+            } else if f.ends_with(".stack") {
+                self.stack.fetch_add(1, Relaxed);
+            } else {
+                self.other.fetch_add(1, Relaxed);
+            }
+        }
     }
 
     impl std::fmt::Display for LatencyStore {
@@ -379,6 +409,7 @@ mod tests {
             location: &OsPath,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
+            self.count(location);
             tokio::time::sleep(self.delay).await;
             self.inner.get_opts(location, options).await
         }
@@ -456,10 +487,14 @@ mod tests {
         };
 
         // Reads now go through a simulated-latency wrapper.
-        let slow: Arc<dyn ObjectStore> = Arc::new(LatencyStore {
-            inner: bucket.clone(),
-            delay: rtt,
-        });
+        let ls = LatencyStore::new(bucket.clone(), rtt);
+        let (larch, rollup, stack, other) = (
+            ls.larch.clone(),
+            ls.rollup.clone(),
+            ls.stack.clone(),
+            ls.other.clone(),
+        );
+        let slow: Arc<dyn ObjectStore> = Arc::new(ls);
 
         // COLD: empty disk cache, empty LRU, empty object cache.
         let cold_dir = tempdir().unwrap();
@@ -468,6 +503,13 @@ mod tests {
         let layer = cold_store.get_layer_from_id(head).await.unwrap().unwrap();
         let cold = t.elapsed();
         assert!(layer.triple_count() >= DEPTH);
+        use std::sync::atomic::Ordering::Relaxed;
+        let cold_gets = (
+            larch.load(Relaxed),
+            rollup.load(Relaxed),
+            stack.load(Relaxed),
+            other.load(Relaxed),
+        );
 
         // WARM (object cache): same store, second read → Arc hit, no I/O.
         let t = Instant::now();
@@ -492,6 +534,10 @@ mod tests {
         println!(
             "disk tier during cold read: {} hits / {} misses, {} bytes fetched from origin",
             stats.hits, stats.misses, stats.bytes_fetched
+        );
+        println!(
+            "cold GETs by object: larch={} rollup.hex={} stack={} other(HEAD/label)={}",
+            cold_gets.0, cold_gets.1, cold_gets.2, cold_gets.3
         );
         println!("=================================================================\n");
     }

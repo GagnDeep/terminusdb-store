@@ -96,6 +96,13 @@ pub trait ArchiveMetadataBackend: Clone + Send + Sync {
     async fn on_layer_finalized(&self, _id: [u32; 5]) -> io::Result<()> {
         Ok(())
     }
+
+    /// Best-effort concurrent warm of rollup-pointer lookups for the given
+    /// layers, so a subsequent read resolves rollups without a sequential GET
+    /// per ancestor. Default no-op for backends without a rollup cache.
+    async fn prefetch_rollups(&self, _ids: &[[u32; 5]]) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct BytesAsyncReader(Bytes);
@@ -380,9 +387,17 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
 /// Maximum number of layer archives fetched concurrently during a prefetch wave.
 const PREFETCH_CONCURRENCY: usize = 16;
 
+/// Cache of rollup-pointer lookups (`layer -> Some(rollup) | None`).
+type RollupCache = Arc<tokio::sync::Mutex<LruCache<[u32; 5], Option<[u32; 5]>>>>;
+
 #[derive(Clone)]
 pub struct LruArchiveBackend<M, D> {
     cache: Arc<tokio::sync::Mutex<LruCache<[u32; 5], CacheEntry>>>,
+    /// Rollup layers are content-addressed and immutable, so a cached pointer
+    /// stays valid; `set_rollup` keeps this in-process consistent. Lets a read
+    /// resolve the whole chain's rollups in one parallel wave instead of one
+    /// sequential GET per ancestor.
+    rollup_cache: RollupCache,
     limit: usize,
     current: usize,
     metadata_origin: M,
@@ -408,9 +423,13 @@ impl CacheEntry {
 impl<M, D> LruArchiveBackend<M, D> {
     pub fn new(metadata_origin: M, data_origin: D, limit: usize) -> Self {
         let cache = Arc::new(tokio::sync::Mutex::new(LruCache::unbounded()));
+        let rollup_cache = Arc::new(tokio::sync::Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(100_000).unwrap(),
+        )));
 
         Self {
             cache,
+            rollup_cache,
             limit,
             current: 0,
             metadata_origin,
@@ -669,10 +688,27 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
         }
     }
     async fn get_rollup(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
-        self.metadata_origin.get_rollup(id).await
+        if let Some(cached) = self.rollup_cache.lock().await.get(&id) {
+            return Ok(*cached);
+        }
+        let result = self.metadata_origin.get_rollup(id).await?;
+        self.rollup_cache.lock().await.put(id, result);
+        Ok(result)
     }
     async fn set_rollup(&self, id: [u32; 5], rollup: [u32; 5]) -> io::Result<()> {
-        self.metadata_origin.set_rollup(id, rollup).await
+        self.metadata_origin.set_rollup(id, rollup).await?;
+        // Keep the rollup cache in-process consistent with the write.
+        self.rollup_cache.lock().await.put(id, Some(rollup));
+        Ok(())
+    }
+    async fn prefetch_rollups(&self, ids: &[[u32; 5]]) -> io::Result<()> {
+        use futures::stream::StreamExt;
+        futures::stream::iter(ids.iter().copied())
+            .for_each_concurrent(PREFETCH_CONCURRENCY, |id| async move {
+                let _ = self.get_rollup(id).await;
+            })
+            .await;
+        Ok(())
     }
 
     async fn get_parent(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
@@ -1585,7 +1621,14 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
         if let Some(bytes) = self.metadata_backend.get_stack_manifest(name).await? {
             if let Some(manifest) = crate::storage::stack_manifest::StackManifest::decode(bytes) {
                 if manifest.is_for(name) {
-                    self.data_backend.prefetch_layers(&manifest.layers).await?;
+                    // Warm archives and rollup pointers in parallel, so the
+                    // sequential discovery walk hits both caches.
+                    let (data, meta) = futures::join!(
+                        self.data_backend.prefetch_layers(&manifest.layers),
+                        self.metadata_backend.prefetch_rollups(&manifest.layers),
+                    );
+                    data?;
+                    meta?;
                 }
             }
         }
