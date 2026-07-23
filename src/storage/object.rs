@@ -42,6 +42,8 @@ use bytes::Bytes;
 use futures::stream::StreamExt;
 use tokio::io::AsyncRead;
 
+use tdb_succinct::logarray_length_from_control_word;
+
 use object_store::path::Path as ObjectPath;
 use object_store::{
     Error as OsError, GetOptions, GetRange, ObjectStore, PutMode, PutOptions, UpdateVersion,
@@ -75,10 +77,14 @@ impl ObjectStoreError {
 const LABEL_CAS_MAX_RETRIES: usize = 16;
 
 /// Upper bound of an archive header (file-presence `u64` + offsets logarray).
-/// The offsets logarray has at most one entry per [`LayerFileEnum`] variant
-/// (~48), so the real header is a few hundred bytes; 8 KiB is a generous,
-/// single-round-trip probe that is guaranteed to contain the whole header.
-const HEADER_PROBE_BYTES: usize = 8192;
+/// The archive header is a file-presence `u64` plus an offsets logarray with at
+/// most one entry per [`LayerFileEnum`] variant (~52), so it is only a few
+/// hundred bytes even for a full layer. This probe is sized generously past that
+/// worst case; the exact header length is then computed from the first 16 bytes
+/// (see [`ObjectArchiveBackend::layer_header`]) and a larger range re-fetched
+/// only in the (not-expected-for-real-layers) case that it does not fit — so we
+/// pay a small probe, not a fixed 8 KiB, on every cold layer read.
+const HEADER_PROBE_BYTES: usize = 512;
 
 fn os_err_to_io(e: OsError) -> io::Error {
     let kind = match &e {
@@ -193,16 +199,34 @@ impl ObjectArchiveBackend {
             return Ok(cached.clone());
         }
         let path = self.layer_key(id);
-        let opts = GetOptions {
-            range: Some(GetRange::Bounded(0..HEADER_PROBE_BYTES)),
-            ..Default::default()
+        let get_range = |range: std::ops::Range<usize>| {
+            let path = path.clone();
+            async move {
+                let opts = GetOptions {
+                    range: Some(GetRange::Bounded(range)),
+                    ..Default::default()
+                };
+                self.store
+                    .get_opts(&path, opts)
+                    .await
+                    .map_err(os_err_to_io)?
+                    .bytes()
+                    .await
+                    .map_err(os_err_to_io)
+            }
         };
-        let result = self
-            .store
-            .get_opts(&path, opts)
-            .await
-            .map_err(os_err_to_io)?;
-        let probe = result.bytes().await.map_err(os_err_to_io)?;
+        let mut probe = get_range(0..HEADER_PROBE_BYTES).await?;
+        // The header is a file-presence u64 (8 bytes) followed by an offsets
+        // logarray whose exact byte length is encoded in its control word, so the
+        // full header size is known from the first 16 bytes. Re-fetch only if the
+        // small probe did not contain the whole header (not expected for real
+        // layers, whose headers are a few hundred bytes at most).
+        if probe.len() >= 16 {
+            let header_len = 16 + logarray_length_from_control_word(&probe[8..16]);
+            if header_len > probe.len() {
+                probe = get_range(0..header_len).await?;
+            }
+        }
         let probe_len = probe.len();
         let (header, remainder) = ArchiveHeader::parse(probe.clone());
         let data_start = probe_len - remainder.len();
@@ -1111,6 +1135,233 @@ mod tests {
             selective as f64 / full as f64 * 100.0
         );
         assert!(selective < full);
+    }
+
+    // Records every ranged GET as (key, start, end) so a profile can attribute
+    // transferred bytes to individual layer structures.
+    struct ProfilingStore {
+        inner: Arc<dyn ObjectStore>,
+        ranges: Arc<std::sync::Mutex<Vec<(String, usize, usize)>>>,
+    }
+    impl std::fmt::Debug for ProfilingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ProfilingStore")
+        }
+    }
+    impl std::fmt::Display for ProfilingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ProfilingStore")
+        }
+    }
+    #[async_trait]
+    impl ObjectStore for ProfilingStore {
+        async fn put_opts(
+            &self,
+            l: &ObjectPath,
+            p: object_store::PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &ObjectPath,
+            o: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(
+            &self,
+            l: &ObjectPath,
+            o: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if let Some(GetRange::Bounded(r)) = &o.range {
+                self.ranges
+                    .lock()
+                    .unwrap()
+                    .push((l.to_string(), r.start, r.end));
+            }
+            self.inner.get_opts(l, o).await
+        }
+        async fn delete(&self, l: &ObjectPath) -> object_store::Result<()> {
+            self.inner.delete(l).await
+        }
+        fn list(
+            &self,
+            p: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(
+            &self,
+            p: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy(&self, f: &ObjectPath, t: &ObjectPath) -> object_store::Result<()> {
+            self.inner.copy(f, t).await
+        }
+        async fn copy_if_not_exists(
+            &self,
+            f: &ObjectPath,
+            t: &ObjectPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(f, t).await
+        }
+    }
+
+    // Profile: attribute the bytes a selective value-existence query transfers to
+    // individual layer structures, to see where the residual (~a third of a full
+    // read) goes and whether block-lazy adjacency (Stage 3) is worth it.
+    // Run with: cargo test --features object-store profile_selective -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn profile_selective_value_exists_byte_breakdown() {
+        use crate::storage::archive::ArchiveHeader;
+        use crate::storage::consts::LayerFileEnum;
+        use num_traits::FromPrimitive;
+
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // Single base layer with a large, multi-datatype value dictionary so all
+        // three dictionaries are block-lazy and adjacency is exercised.
+        let head = {
+            let store = crate::store::open_object_store(bucket.clone(), "", 1 << 30);
+            let db = store.create("g").await.unwrap();
+            let builder = store.create_base_layer().await.unwrap();
+            for i in 0..3000 {
+                builder
+                    .add_value_triple(ValueTriple::new_string_value(
+                        &format!("s{:05}", i),
+                        "p",
+                        &format!("o{:05}", i),
+                    ))
+                    .unwrap();
+            }
+            let layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+            layer.name()
+        };
+        let target = ValueTriple::new_string_value("s01000", "p", "o01000");
+
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = crate::store::open_object_store(
+            Arc::new(ProfilingStore {
+                inner: bucket.clone(),
+                ranges: ranges.clone(),
+            }),
+            "",
+            0,
+        );
+        assert!(store
+            .selective_value_triple_exists(head, &target)
+            .await
+            .unwrap());
+
+        // Read the whole layer object and parse its header to map byte ranges to
+        // structures.
+        let key = {
+            let s = crate::storage::name_to_string(head);
+            ObjectPath::from(format!("{}/{}.larch", &s[0..3], s))
+        };
+        let layer_bytes = bucket.get(&key).await.unwrap().bytes().await.unwrap();
+        let full_len = layer_bytes.len();
+        let (header, remainder) = ArchiveHeader::parse(layer_bytes.clone());
+        let data_start = full_len - remainder.len();
+
+        // Category label for each structure.
+        fn category(f: LayerFileEnum) -> &'static str {
+            use LayerFileEnum::*;
+            match f {
+                NodeDictionaryBlocks | NodeDictionaryOffsets => "node dict",
+                PredicateDictionaryBlocks | PredicateDictionaryOffsets => "predicate dict",
+                ValueDictionaryTypesPresent
+                | ValueDictionaryTypeOffsets
+                | ValueDictionaryBlocks
+                | ValueDictionaryOffsets => "value dict",
+                NodeValueIdMapBits
+                | NodeValueIdMapBitIndexBlocks
+                | NodeValueIdMapBitIndexSBlocks
+                | PredicateIdMapBits
+                | PredicateIdMapBitIndexBlocks
+                | PredicateIdMapBitIndexSBlocks => "id maps",
+                PosSubjects | PosObjects | NegSubjects | NegObjects => "subj/obj arrays",
+                PosSPAdjacencyListNums
+                | PosSPAdjacencyListBits
+                | PosSPAdjacencyListBitIndexBlocks
+                | PosSPAdjacencyListBitIndexSBlocks
+                | NegSPAdjacencyListNums
+                | NegSPAdjacencyListBits
+                | NegSPAdjacencyListBitIndexBlocks
+                | NegSPAdjacencyListBitIndexSBlocks => "s_p adjacency",
+                PosSpOAdjacencyListNums
+                | PosSpOAdjacencyListBits
+                | PosSpOAdjacencyListBitIndexBlocks
+                | PosSpOAdjacencyListBitIndexSBlocks
+                | NegSpOAdjacencyListNums
+                | NegSpOAdjacencyListBits
+                | NegSpOAdjacencyListBitIndexBlocks
+                | NegSpOAdjacencyListBitIndexSBlocks => "sp_o adjacency",
+                _ => "other",
+            }
+        }
+
+        // Build absolute spans for every present structure.
+        let mut spans: Vec<(usize, usize, &'static str)> = Vec::new();
+        for i in 0..64u64 {
+            if let Some(f) = LayerFileEnum::from_u64(i) {
+                if let Some(r) = header.range_for(f) {
+                    spans.push((data_start + r.start, data_start + r.end, category(f)));
+                }
+            }
+        }
+
+        let mut by_cat: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        let mut total = 0usize;
+        for (k, start, end) in ranges.lock().unwrap().iter() {
+            let len = end - start;
+            total += len;
+            if k != &key.to_string() {
+                *by_cat.entry("other object (manifest/label)").or_default() += len;
+                continue;
+            }
+            if *start == 0 {
+                *by_cat.entry("header probe").or_default() += len;
+                continue;
+            }
+            let mid = start + len / 2;
+            let cat = spans
+                .iter()
+                .find(|(s, e, _)| mid >= *s && mid < *e)
+                .map(|(_, _, c)| *c)
+                .unwrap_or("unattributed");
+            *by_cat.entry(cat).or_default() += len;
+        }
+
+        println!("\n=== selective value-exists byte breakdown ===");
+        println!("full layer object = {} bytes", full_len);
+        println!(
+            "actual header size = {} bytes (probe fetches {})",
+            data_start, HEADER_PROBE_BYTES
+        );
+        println!(
+            "selective total   = {} bytes ({:.0}% of full)\n",
+            total,
+            total as f64 / full_len as f64 * 100.0
+        );
+        let mut rows: Vec<_> = by_cat.into_iter().collect();
+        rows.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+        for (cat, bytes) in rows {
+            println!(
+                "  {:<28} {:>8} bytes  ({:>4.1}% of selective, {:>4.1}% of full)",
+                cat,
+                bytes,
+                bytes as f64 / total as f64 * 100.0,
+                bytes as f64 / full_len as f64 * 100.0
+            );
+        }
+        println!();
     }
 
     // ---- Milestone 2: write path — commit a chain, drop, reopen, read back ----
