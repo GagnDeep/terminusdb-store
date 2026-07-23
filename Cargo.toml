@@ -48,3 +48,7 @@ object-store = ["dep:object_store"]
 [[example]]
 name = "object_store_graph"
 required-features = ["object-store"]
+
+[[example]]
+name = "bench_object_store"
+required-features = ["object-store"]
