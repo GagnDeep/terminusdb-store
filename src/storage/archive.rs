@@ -56,6 +56,26 @@ pub trait ArchiveBackend: Clone + Send + Sync {
     async fn prefetch_layers(&self, _ids: &[[u32; 5]]) -> io::Result<()> {
         Ok(())
     }
+
+    /// Fetch a byte sub-range *within* a layer structure (relative to the start
+    /// of that structure). The default fetches the whole structure and slices;
+    /// backends over object storage override this to issue a bounded ranged GET,
+    /// which is what makes block-lazy structure access possible on a disk-less
+    /// replica (fetch only the blocks a lookup touches).
+    async fn get_layer_structure_range(
+        &self,
+        id: [u32; 5],
+        file_type: LayerFileEnum,
+        range: std::ops::Range<usize>,
+    ) -> io::Result<Bytes> {
+        let whole = self
+            .get_layer_structure_bytes(id, file_type)
+            .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "structure not found"))?;
+        let end = range.end.min(whole.len());
+        let start = range.start.min(end);
+        Ok(whole.slice(start..end))
+    }
 }
 
 #[async_trait]

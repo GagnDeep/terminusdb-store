@@ -30,6 +30,8 @@ mod label;
 #[macro_use]
 mod layer;
 pub mod archive;
+#[cfg(feature = "object-store")]
+pub mod block_lazy;
 mod copy;
 pub mod delta;
 mod locking;
