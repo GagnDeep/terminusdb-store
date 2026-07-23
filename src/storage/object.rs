@@ -922,4 +922,124 @@ mod tests {
             );
         }
     }
+
+    // ---- Milestone 5: integration tests against real object storage ----
+    //
+    // These are #[ignore]d and only run when pointed at a live S3-compatible
+    // endpoint (MinIO/LocalStack/R2/S3) via environment variables. Bring up the
+    // provided MinIO with `docker compose -f docker-compose.minio.yml up -d`,
+    // then:
+    //
+    //   TDB_OBJECT_STORE_ENDPOINT=http://localhost:9100 \
+    //   TDB_OBJECT_STORE_BUCKET=terminusdb \
+    //   TDB_OBJECT_STORE_ACCESS_KEY_ID=minioadmin \
+    //   TDB_OBJECT_STORE_SECRET_ACCESS_KEY=minioadmin \
+    //   cargo test --features object-store -- --ignored --nocapture minio_
+    //
+    // Each test uses a unique key prefix so runs don't collide and cleanup is
+    // unnecessary.
+    use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+    use std::env;
+
+    fn s3_from_env() -> Arc<dyn ObjectStore> {
+        let endpoint = env::var("TDB_OBJECT_STORE_ENDPOINT")
+            .expect("set TDB_OBJECT_STORE_ENDPOINT to run the MinIO integration tests");
+        let bucket = env::var("TDB_OBJECT_STORE_BUCKET")
+            .expect("set TDB_OBJECT_STORE_BUCKET to run the MinIO integration tests");
+        let access =
+            env::var("TDB_OBJECT_STORE_ACCESS_KEY_ID").unwrap_or_else(|_| "minioadmin".to_string());
+        let secret = env::var("TDB_OBJECT_STORE_SECRET_ACCESS_KEY")
+            .unwrap_or_else(|_| "minioadmin".to_string());
+        let region =
+            env::var("TDB_OBJECT_STORE_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+
+        let s3 = AmazonS3Builder::new()
+            .with_endpoint(endpoint)
+            .with_bucket_name(bucket)
+            .with_access_key_id(access)
+            .with_secret_access_key(secret)
+            .with_region(region)
+            .with_allow_http(true) // MinIO over http; drop for https R2/S3
+            // MinIO and R2 support conditional PUT via If-Match/If-None-Match,
+            // which is what the label compare-and-swap relies on.
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .build()
+            .expect("failed to build S3 store from environment");
+        Arc::new(s3)
+    }
+
+    fn unique_prefix(tag: &str) -> String {
+        format!("it/{}/{:016x}", tag, rand::random::<u64>())
+    }
+
+    /// Full end-to-end round-trip against a real object store using the public
+    /// `Store` API: create a database, commit a two-layer chain, set the head,
+    /// then reopen the store from the same bucket+prefix and read it back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn minio_end_to_end_roundtrip() {
+        use crate::store::open_object_store;
+
+        let s3 = s3_from_env();
+        let prefix = unique_prefix("roundtrip");
+
+        {
+            let store = open_object_store(s3.clone(), prefix.clone(), 100);
+            let db = store.create("graph").await.unwrap();
+            assert!(db.head().await.unwrap().is_none());
+
+            let builder = store.create_base_layer().await.unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_string_value("cow", "says", "moo"))
+                .unwrap();
+            let l1 = builder.commit().await.unwrap();
+            assert!(db.set_head(&l1).await.unwrap());
+
+            let builder = l1.open_write().await.unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_string_value("pig", "says", "oink"))
+                .unwrap();
+            let l2 = builder.commit().await.unwrap();
+            assert!(db.set_head(&l2).await.unwrap());
+            // store dropped here — nothing kept in process
+        }
+
+        // Reopen a brand-new store over the same bucket and prefix.
+        let store = open_object_store(s3.clone(), prefix.clone(), 100);
+        let db = store
+            .open("graph")
+            .await
+            .unwrap()
+            .expect("database must exist after reopening from the bucket");
+        let head = db.head().await.unwrap().unwrap();
+        assert!(head.value_triple_exists(&ValueTriple::new_string_value("cow", "says", "moo")));
+        assert!(head.value_triple_exists(&ValueTriple::new_string_value("pig", "says", "oink")));
+    }
+
+    /// Compare-and-swap against a real object store: two racers advancing the
+    /// same label from an identical snapshot yield exactly one winner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn minio_label_cas_single_winner() {
+        let store = Arc::new(ObjectLabelStore::new(s3_from_env(), unique_prefix("cas")));
+        store.create_label("race").await.unwrap();
+        let snapshot = store.get_label("race").await.unwrap().unwrap();
+
+        let a = {
+            let store = store.clone();
+            let snapshot = snapshot.clone();
+            tokio::spawn(async move { store.set_label(&snapshot, [1, 1, 1, 1, 1]).await })
+        };
+        let b = {
+            let store = store.clone();
+            let snapshot = snapshot.clone();
+            tokio::spawn(async move { store.set_label(&snapshot, [2, 2, 2, 2, 2]).await })
+        };
+
+        let ra = a.await.unwrap().unwrap();
+        let rb = b.await.unwrap().unwrap();
+        let winners = [ra.is_some(), rb.is_some()].iter().filter(|x| **x).count();
+        assert_eq!(1, winners, "exactly one racer must win the CAS");
+        assert_eq!(1, store.get_label("race").await.unwrap().unwrap().version);
+    }
 }

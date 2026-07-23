@@ -1,6 +1,6 @@
 # RFC: Object-storage backend for terminus-store
 
-Status: **Draft (Milestone 0 — reconnaissance)**
+Status: **Implemented — Milestones 0–5 complete** (feature `object-store`, default off)
 Author: object-store backend work
 Target crate: `terminus-store` (this repo), v0.21.5, edition 2018
 Feature gate: `object-store` (default **off**)
@@ -420,13 +420,25 @@ object-store = ["dep:object_store"]
 once `cargo` resolves it; `aws`/`gcp`/`azure` features enable the cloud stores,
 R2/MinIO reached via the S3 store's endpoint override.)
 
-Public API (mirrors the existing `open_*` functions in `src/store/mod.rs`):
+Public API **as built** (mirrors the existing `open_*` functions in
+`src/store/mod.rs`):
 
 ```rust
 #[cfg(feature = "object-store")]
-pub fn open_object_store(url: &str, options: /* endpoint/creds */, cache_size: usize)
-    -> io::Result<Store>;
-// builds: ObjectArchiveBackend --wrapped in--> LruArchiveBackend
+pub fn open_object_store(
+    store: Arc<dyn object_store::ObjectStore>,
+    prefix: impl Into<String>,
+    cache_size: usize,               // MiB, in-memory LRU of whole archives
+) -> Store;
+
+#[cfg(feature = "object-store")]
+pub fn open_object_store_with_cache(
+    store: Arc<dyn object_store::ObjectStore>,
+    prefix: impl Into<String>,
+    mem_cache_size: usize,           // MiB in RAM
+    disk_cache_dir: PathBuf,         // local-disk spill tier (Milestone 4)
+) -> (Store, DiskSpillArchiveBackend<ObjectArchiveBackend>);  // 2nd = metrics handle
+// builds: ObjectArchiveBackend [--> DiskSpillArchiveBackend] --> LruArchiveBackend
 //         --> ArchiveLayerStore --> CachedLayerStore(LockingHashMapLayerCache)
 //         + ObjectLabelStore
 ```
@@ -436,19 +448,33 @@ Internally the layer store is literally
 `ObjectArchiveBackend` — **identical shape to `open_archive_store`**, only the
 leaf backend and the label store differ.
 
-`ObjectArchiveBackend` holds an `Arc<dyn object_store::ObjectStore>` + a key
-prefix + a small runtime handle for the LIST/HEAD/GET/PUT translations in §6.
-Ranged reads (`get_layer_structure_bytes`, `read_layer_structure_bytes_from`) use
-`ObjectStore::get_opts` with a byte `Range` after fetching/parsing the archive
-header (or fall back to whole-object GET + in-memory slice; both correct).
+The constructor takes an already-built `Arc<dyn ObjectStore>` rather than a URL
+string, which (a) avoids adding the `url` crate as a direct dependency and (b)
+lets callers use the full `AmazonS3Builder`/`GoogleCloudStorageBuilder`/
+`MicrosoftAzureBuilder` configuration surface directly. `ObjectArchiveBackend`
+holds that `Arc` + a key prefix and performs the LIST/HEAD/GET/PUT translations
+in §6. Ranged reads (`get_layer_structure_bytes`,
+`read_layer_structure_bytes_from`) parse the archive header via one bounded
+`get_opts` probe, then issue a second bounded `get_opts` for the exact structure
+range.
 
-### URI grammar (Milestone 5, documented now)
+### Configuration (Milestone 5, verified)
 
-`object_store::parse_url_opts` handles `s3://bucket/prefix`, `gs://…`,
-`az://…`, `file:///…`, `memory://`. Endpoint override (R2/MinIO/LocalStack) and
-credentials pass through `object_store`'s option map
+Credentials and the R2/MinIO/LocalStack endpoint override are supplied through
+`object_store`'s builders, e.g. `AmazonS3Builder::new().with_endpoint(…)
+.with_bucket_name(…).with_access_key_id(…).with_secret_access_key(…)
+.with_region(…).with_allow_http(true).with_conditional_put(S3ConditionalPut::ETagMatch)`.
+The `ETagMatch` conditional-put mode is what makes the label CAS work against
+MinIO and R2 (both honour `If-Match`/`If-None-Match`). `object_store`'s env vars
 (`AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`,
-`AWS_ALLOW_HTTP=true` for http endpoints). No hand-rolled S3 client.
+`AWS_ALLOW_HTTP`) work too. No hand-rolled S3 client.
+
+`docker-compose.minio.yml` brings up MinIO for the two `#[ignore]`d integration
+tests in `src/storage/object.rs` (`minio_end_to_end_roundtrip`,
+`minio_label_cas_single_winner`), gated by the `TDB_OBJECT_STORE_*` env vars.
+Both were **run green against a live MinIO** during development: a full
+create-db → commit-chain → reopen → read-back round-trip, and a two-racer label
+CAS yielding exactly one winner.
 
 ---
 
@@ -503,12 +529,22 @@ Reading of the numbers:
 
 ## 9. Verification posture (all milestones)
 
-`cargo test`, `cargo clippy --all-targets`, `cargo fmt --check` must pass with the
-feature **both on and off** (`--features object-store` and default). Milestones
-1–4 develop against `object_store`'s `memory://` and `file://` backends → **no
-network**. Milestone 5 adds `#[ignore]`d MinIO/LocalStack integration tests gated
-by an env var (no such optional-test pattern exists in the repo yet — this
-introduces one) and a docker-compose service for CI/local.
+`cargo test`, `cargo clippy` (lib+tests), and `cargo fmt --check` pass with the
+feature **both on and off** (`--features object-store` and default): 247 tests
+with the feature on (231 pre-existing untouched + 16 new, incl. one `#[ignore]`d
+benchmark), 231 with it off.
+
+> Note on `--all-targets`: this repo's benchmarks use `#![feature(test)]`, which
+> only compiles on the **nightly** toolchain. On stable, `cargo clippy
+> --all-targets` fails at the bench crates *before and independent of* this work
+> (`error[E0554]`). Milestone verification therefore runs clippy over `--lib
+> --tests`; run benches (and `--all-targets`) under nightly.
+
+Milestones 1–4 develop against `object_store`'s in-memory and local-filesystem
+backends → **no network**. Milestone 5 adds two `#[ignore]`d MinIO integration
+tests gated by `TDB_OBJECT_STORE_*` env vars (no optional-test pattern existed in
+the repo — this introduces one) plus `docker-compose.minio.yml`; both were run
+green against a live MinIO.
 
 ---
 
