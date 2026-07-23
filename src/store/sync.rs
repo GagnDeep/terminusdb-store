@@ -571,6 +571,72 @@ impl SyncLazyLayer {
             .map(|it| Box::new(it) as Box<dyn Iterator<Item = IdTriple> + Send>)
     }
 
+    // ---- single-layer deltas (this head layer's own additions/removals) ----
+    // Mirror the SyncStoreLayer delta API the store-prolog FFI predicates need;
+    // disk-less (only this layer's adjacency is loaded).
+    pub fn triple_addition_exists(&self, s: u64, p: u64, o: u64) -> io::Result<bool> {
+        task_sync(self.inner.triple_addition_exists(s, p, o))
+    }
+    pub fn triple_removal_exists(&self, s: u64, p: u64, o: u64) -> io::Result<bool> {
+        task_sync(self.inner.triple_removal_exists(s, p, o))
+    }
+    pub fn triple_additions(&self) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_additions())
+    }
+    pub fn triple_removals(&self) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_removals())
+    }
+    pub fn triple_additions_s(
+        &self,
+        subject: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_additions_s(subject))
+    }
+    pub fn triple_removals_s(
+        &self,
+        subject: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_removals_s(subject))
+    }
+    pub fn triple_additions_sp(
+        &self,
+        subject: u64,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_additions_sp(subject, predicate))
+    }
+    pub fn triple_removals_sp(
+        &self,
+        subject: u64,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_removals_sp(subject, predicate))
+    }
+    pub fn triple_additions_p(
+        &self,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_additions_p(predicate))
+    }
+    pub fn triple_removals_p(
+        &self,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_removals_p(predicate))
+    }
+    pub fn triple_additions_o(
+        &self,
+        object: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_additions_o(object))
+    }
+    pub fn triple_removals_o(
+        &self,
+        object: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_removals_o(object))
+    }
+
     // ---- forward resolution (string -> id) ----
     pub fn subject_id(&self, subject: &str) -> io::Result<Option<u64>> {
         task_sync(self.inner.subject_id(subject))
@@ -801,6 +867,85 @@ mod tests {
         es.sort();
         ls.sort();
         assert_eq!(es, ls);
+    }
+
+    // The disk-less single-layer delta iterators must match the materialized
+    // head layer's own additions/removals (what the store-prolog FFI needs).
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn sync_lazy_layer_deltas_match_materialized() {
+        use crate::store::open_object_store;
+        use std::sync::Arc;
+
+        let bucket: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let store = SyncStore::wrap(open_object_store(bucket, "", 1 << 30));
+        let db = store.create("g").unwrap();
+        let vn = |s: &str, o: &str| ValueTriple::new_node(s, "rel", o);
+
+        let builder = store.create_base_layer().unwrap();
+        for i in 0..600 {
+            builder
+                .add_value_triple(vn(&format!("n{:04}", i), &format!("n{:04}", (i + 1) % 600)))
+                .unwrap();
+        }
+        let mut layer = builder.commit().unwrap();
+        db.set_head(&layer).unwrap();
+        // child layer with its own additions and removals -> the head has a delta
+        let builder = layer.open_write().unwrap();
+        for i in 600..640 {
+            builder
+                .add_value_triple(vn(&format!("n{:04}", i), &format!("n{:04}", i)))
+                .unwrap();
+        }
+        for i in 0..20 {
+            builder
+                .remove_value_triple(vn(&format!("n{:04}", i), &format!("n{:04}", (i + 1) % 600)))
+                .unwrap();
+        }
+        layer = builder.commit().unwrap();
+        db.set_head(&layer).unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).unwrap().unwrap(); // materialized head
+        let lazy = store.lazy_layer(head); // disk-less
+
+        let sorted = |it: Box<dyn Iterator<Item = IdTriple> + Send>| {
+            let mut v: Vec<IdTriple> = it.collect();
+            v.sort();
+            v
+        };
+
+        let fa = sorted(full.triple_additions().unwrap());
+        let la = sorted(lazy.triple_additions().unwrap());
+        assert_eq!(fa, la);
+        assert!(!fa.is_empty());
+        let fr = sorted(full.triple_removals().unwrap());
+        let lr = sorted(lazy.triple_removals().unwrap());
+        assert_eq!(fr, lr);
+        assert!(!fr.is_empty());
+
+        // exists + filtered variants on a real addition and removal
+        let a = fa[0];
+        assert!(lazy
+            .triple_addition_exists(a.subject, a.predicate, a.object)
+            .unwrap());
+        assert_eq!(
+            sorted(full.triple_additions_s(a.subject).unwrap()),
+            sorted(lazy.triple_additions_s(a.subject).unwrap())
+        );
+        assert_eq!(
+            sorted(full.triple_additions_o(a.object).unwrap()),
+            sorted(lazy.triple_additions_o(a.object).unwrap())
+        );
+        let r = fr[0];
+        assert!(lazy
+            .triple_removal_exists(r.subject, r.predicate, r.object)
+            .unwrap());
+        assert_eq!(
+            sorted(full.triple_removals_s(r.subject).unwrap()),
+            sorted(lazy.triple_removals_s(r.subject).unwrap())
+        );
     }
 
     #[test]

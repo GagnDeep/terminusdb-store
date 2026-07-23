@@ -1988,6 +1988,119 @@ impl LazyLayer {
         self.store.selective_id_triples(self.head).await
     }
 
+    // ---- single-layer deltas (this head layer's own additions/removals) ----
+    //
+    // These mirror the `SyncStoreLayer` delta API the store-prolog FFI predicates
+    // `id_triple_addition` / `id_triple_removal` need. They are disk-less on an
+    // object backend: each loads only this one layer's adjacency (via the
+    // LayerStore's single-layer iterators), never a whole materialized layer.
+    pub async fn triple_addition_exists(
+        &self,
+        subject: u64,
+        predicate: u64,
+        object: u64,
+    ) -> io::Result<bool> {
+        self.store
+            .layer_store
+            .triple_addition_exists(self.head, subject, predicate, object)
+            .await
+    }
+    pub async fn triple_removal_exists(
+        &self,
+        subject: u64,
+        predicate: u64,
+        object: u64,
+    ) -> io::Result<bool> {
+        self.store
+            .layer_store
+            .triple_removal_exists(self.head, subject, predicate, object)
+            .await
+    }
+    pub async fn triple_additions(&self) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        Ok(Box::new(
+            self.store.layer_store.triple_additions(self.head).await?,
+        ))
+    }
+    pub async fn triple_removals(&self) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        Ok(Box::new(
+            self.store.layer_store.triple_removals(self.head).await?,
+        ))
+    }
+    pub async fn triple_additions_s(
+        &self,
+        subject: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_additions_s(self.head, subject)
+            .await
+    }
+    pub async fn triple_removals_s(
+        &self,
+        subject: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_removals_s(self.head, subject)
+            .await
+    }
+    pub async fn triple_additions_sp(
+        &self,
+        subject: u64,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_additions_sp(self.head, subject, predicate)
+            .await
+    }
+    pub async fn triple_removals_sp(
+        &self,
+        subject: u64,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_removals_sp(self.head, subject, predicate)
+            .await
+    }
+    pub async fn triple_additions_p(
+        &self,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_additions_p(self.head, predicate)
+            .await
+    }
+    pub async fn triple_removals_p(
+        &self,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_removals_p(self.head, predicate)
+            .await
+    }
+    pub async fn triple_additions_o(
+        &self,
+        object: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_additions_o(self.head, object)
+            .await
+    }
+    pub async fn triple_removals_o(
+        &self,
+        object: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_removals_o(self.head, object)
+            .await
+    }
+
     // ---- forward resolution (string -> id) ----
     pub async fn subject_id(&self, subject: &str) -> io::Result<Option<u64>> {
         self.store.selective_subject_id(self.head, subject).await
