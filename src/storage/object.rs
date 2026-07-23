@@ -1102,4 +1102,119 @@ mod tests {
         assert_eq!(1, winners, "exactly one racer must win the CAS");
         assert_eq!(1, store.get_label("race").await.unwrap().unwrap().version);
     }
+
+    /// Build a deep chain over real object storage, confirm a `.stack` manifest
+    /// object was written, then reopen a fresh store and read the head through
+    /// the manifest + parallel-prefetch read path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn minio_deep_chain_manifest_read() {
+        use crate::store::open_object_store;
+        const DEPTH: usize = 8;
+
+        let s3 = s3_from_env();
+        let prefix = unique_prefix("deep");
+
+        {
+            let store = open_object_store(s3.clone(), prefix.clone(), 100);
+            let db = store.create("chain").await.unwrap();
+            let builder = store.create_base_layer().await.unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_string_value("root", "p", "0"))
+                .unwrap();
+            let mut layer = builder.commit().await.unwrap();
+            assert!(db.set_head(&layer).await.unwrap());
+            for i in 1..DEPTH {
+                let builder = layer.open_write().await.unwrap();
+                builder
+                    .add_value_triple(ValueTriple::new_string_value(
+                        &format!("s{}", i),
+                        "p",
+                        &format!("o{}", i),
+                    ))
+                    .unwrap();
+                layer = builder.commit().await.unwrap();
+                assert!(db.set_head(&layer).await.unwrap());
+            }
+        }
+
+        // A stack manifest object must exist under the prefix.
+        let mut stacks = 0;
+        let mut stream = s3.list(Some(&ObjectPath::from(prefix.clone())));
+        while let Some(meta) = stream.next().await {
+            let meta = meta.unwrap();
+            if meta
+                .location
+                .filename()
+                .map(|f| f.ends_with(".stack"))
+                .unwrap_or(false)
+            {
+                stacks += 1;
+            }
+        }
+        assert!(stacks >= 1, "expected at least one .stack manifest object");
+
+        // Reopen fresh and read the head via manifest + prefetch.
+        let store = open_object_store(s3.clone(), prefix.clone(), 100);
+        let db = store.open("chain").await.unwrap().unwrap();
+        let head = db.head().await.unwrap().unwrap();
+        assert!(head.value_triple_exists(&ValueTriple::new_string_value("root", "p", "0")));
+        assert!(head.value_triple_exists(&ValueTriple::new_string_value("s7", "p", "o7")));
+    }
+
+    /// Group commit over real object storage: many buffered commits flush into
+    /// one layer, and a fresh store reads them all back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn minio_group_commit_over_s3() {
+        use crate::store::buffered::BufferedNamedGraph;
+        use crate::store::open_object_store;
+
+        let s3 = s3_from_env();
+        let prefix = unique_prefix("buffered");
+        let store = open_object_store(s3.clone(), prefix.clone(), 100);
+
+        let db = store.create("gc").await.unwrap();
+        let builder = store.create_base_layer().await.unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("seed", "p", "v"))
+            .unwrap();
+        let layer = builder.commit().await.unwrap();
+        assert!(db.set_head(&layer).await.unwrap());
+
+        let buffered = BufferedNamedGraph::open(store.clone(), "gc", 0)
+            .await
+            .unwrap();
+        for i in 0..20 {
+            buffered
+                .add(ValueTriple::new_string_value(
+                    &format!("k{}", i),
+                    "p",
+                    &format!("v{}", i),
+                ))
+                .await
+                .unwrap();
+        }
+        buffered.flush().await.unwrap().unwrap();
+
+        // Fresh store reads all 20 buffered triples plus the seed.
+        let store2 = open_object_store(s3.clone(), prefix.clone(), 100);
+        let head = store2
+            .open("gc")
+            .await
+            .unwrap()
+            .unwrap()
+            .head()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(head.value_triple_exists(&ValueTriple::new_string_value("seed", "p", "v")));
+        for i in 0..20 {
+            assert!(head.value_triple_exists(&ValueTriple::new_string_value(
+                &format!("k{}", i),
+                "p",
+                &format!("v{}", i),
+            )));
+        }
+    }
 }
