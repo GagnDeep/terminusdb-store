@@ -128,6 +128,11 @@ pub struct ObjectArchiveBackend {
     /// per-structure reads of one layer share a single header probe instead of
     /// re-fetching the ~8 KiB header each time.
     header_cache: Arc<tokio::sync::Mutex<lru::LruCache<[u32; 5], (ArchiveHeader, usize)>>>,
+    /// Per-layer locks that single-flight the header probe: when many reads of a
+    /// cold layer are issued concurrently (as the selective read path does), the
+    /// first probes and caches the header and the rest wait for it, instead of
+    /// each issuing its own redundant probe.
+    header_locks: Arc<std::sync::Mutex<lru::LruCache<[u32; 5], Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl ObjectArchiveBackend {
@@ -143,6 +148,9 @@ impl ObjectArchiveBackend {
             store,
             prefix,
             header_cache: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(4096).unwrap(),
+            ))),
+            header_locks: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(4096).unwrap(),
             ))),
         }
@@ -195,6 +203,20 @@ impl ObjectArchiveBackend {
     /// Fetch and parse the archive header of a layer, returning the header plus
     /// the absolute byte offset at which the data section begins.
     async fn layer_header(&self, id: [u32; 5]) -> io::Result<(ArchiveHeader, usize)> {
+        if let Some(cached) = self.header_cache.lock().await.get(&id) {
+            return Ok(cached.clone());
+        }
+        // Single-flight: serialize concurrent first-touches of the same cold
+        // layer so exactly one probes the header. Different layers still proceed
+        // concurrently (per-id lock). The lock is held across the probe below.
+        let id_lock = self
+            .header_locks
+            .lock()
+            .unwrap()
+            .get_or_insert(id, || Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _probe_guard = id_lock.lock().await;
+        // Another task may have populated the cache while we waited for the lock.
         if let Some(cached) = self.header_cache.lock().await.get(&id) {
             return Ok(cached.clone());
         }
@@ -364,6 +386,13 @@ impl ArchiveMetadataBackend for ObjectArchiveBackend {
     }
 
     async fn layer_exists(&self, id: [u32; 5]) -> io::Result<bool> {
+        // A cached header proves existence; layers are immutable, so once a layer
+        // is known to exist it exists forever. This elides the repeated HEAD that
+        // `directory_exists` triggers all over the read path. (Only positive
+        // results are cached: a not-yet-finalized layer may appear later.)
+        if self.header_cache.lock().await.contains(&id) {
+            return Ok(true);
+        }
         let path = self.layer_key(id);
         match self.store.head(&path).await {
             Ok(_) => Ok(true),
