@@ -114,13 +114,29 @@ no-fork decision held — `SizedDictBlock::{parse,entry,id,num_entries}` and
 - **Payoff:** dictionaries — usually the largest resident part — are now
   fetch-on-touch in both directions, with only the offset table resident, **without
   forking tdb-succinct**.
-- **2c — wire into the live selective path** (remaining): replace the whole-dictionary
-  loads in `Store::selective_value_triple_exists` (`get_node_dictionary` etc.) with
-  `BlockLazyStringDict` lookups. Requires plumbing `get_layer_structure_range` up
-  through the `LayerStore` seam (today it lives on `ArchiveBackend`); per the
-  measure-first posture, justify with a byte/RSS measurement first (Stage 1b's
-  string-selective path already transfers ~78% — the dictionaries are what remains to
-  shrink there).
+- **2c — wire into the live selective path** (done): `Store::selective_value_triple_exists`
+  now resolves subject/predicate strings via `BlockLazyStringDict` when the backend
+  supports ranged reads and the dictionary is large enough to win. Plumbed a small
+  object-safe `BlockSource` seam exposed through `PersistentLayerStore` →
+  `LayerStore::block_source` (default `None`, forwarded by `CachedLayerStore`), so a
+  `dyn LayerStore` hands out a block source without exposing backend types.
+  - **Measured win:** the object-store string-exists byte-transfer test went from
+    ~78% of a full read to **56%** on a 3 000-entry node dictionary.
+  - **Two fixes the measurement surfaced:** (1) `LruArchiveBackend` used the trait-
+    default `get_layer_structure_range` (whole structure + slice), so each block fetch
+    pulled the *entire* dictionary through the cache tier (78% → 233%); it now delegates
+    a true ranged read to its origin when the layer isn't cached (→ 56%). (2) A
+    `BLOCK_LAZY_MIN_ENTRIES = 512` threshold keeps small dictionaries on the whole-dict
+    path, where one GET transfers fewer bytes than the offset table + O(log n) blocks —
+    block-lazy is a large-dictionary optimization.
+  - **Empty-dictionary guard:** a layer that adds no new nodes/predicates stores a
+    zero-filled block the codec rejects; resolution skips a layer whose per-kind count
+    is 0, matching the whole-dict path.
+  - Differential-tested on both branches (small-dict whole-dict path and a >512-entry
+    block-lazy path) against the fully-materialized layer.
+
+  Values (`TypedDict`) still load whole — block-lazy is string-dictionary only; a typed
+  block-lazy reader is the remaining increment if value dictionaries become the ceiling.
 
 ### Stage 3 — block-lazy rank/select (hardest, likely partial)
 - `BitIndex`/`AdjacencyList`/`WaveletTree` do random indexing + data-dependent
