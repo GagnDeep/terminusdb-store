@@ -94,6 +94,24 @@ impl BufferedNamedGraph {
         Self::open_inner(store, label, max_ops, Some(wal)).await
     }
 
+    /// Like [`open_with_wal`](Self::open_with_wal) but the log lives in an object
+    /// store under `wal_prefix` instead of on local disk, so durable group commit
+    /// needs no local disk. Each buffered op is one small object (a successful
+    /// PUT is the durability point); recovery replays and reconciles exactly as
+    /// with the file log.
+    #[cfg(feature = "object-store")]
+    pub async fn open_with_object_wal(
+        store: Store,
+        label: &str,
+        max_ops: usize,
+        object_store: std::sync::Arc<dyn object_store::ObjectStore>,
+        wal_prefix: impl Into<String>,
+    ) -> io::Result<Self> {
+        let wal: Arc<dyn Wal> =
+            Arc::new(super::wal::ObjectWal::open(object_store, wal_prefix).await?);
+        Self::open_inner(store, label, max_ops, Some(wal)).await
+    }
+
     async fn open_inner(
         store: Store,
         label: &str,
@@ -428,6 +446,81 @@ mod tests {
             BufferedNamedGraph::open_with_wal(store.clone(), &label, 0, &wal_path, PerCommitFsync)
                 .await
                 .unwrap();
+        assert_eq!(0, b3.pending_ops().await);
+    }
+
+    // Same durable-group-commit crash recovery, but with the WAL in the bucket
+    // (no local disk anywhere) — the graph and its log share one object store.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn object_wal_recovers_unflushed_commits_disk_less() {
+        use crate::store::open_object_store;
+
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = open_object_store(bucket.clone(), "", 1 << 30);
+        let db = store.create("g").await.unwrap();
+        let builder = store.create_base_layer().await.unwrap();
+        builder.add_value_triple(vt("cow", "says", "moo")).unwrap();
+        let layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let label = "g".to_string();
+
+        // buffer two commits, then "crash" (drop without flushing). The WAL lives
+        // in the bucket under "g.wal", so nothing is on local disk.
+        {
+            let b = BufferedNamedGraph::open_with_object_wal(
+                store.clone(),
+                &label,
+                0,
+                bucket.clone(),
+                "g.wal",
+            )
+            .await
+            .unwrap();
+            b.add(vt("x", "p", "1")).await.unwrap();
+            b.add(vt("y", "p", "2")).await.unwrap();
+        }
+
+        // reopen: the un-flushed commits are recovered from the bucket-backed WAL
+        let b = BufferedNamedGraph::open_with_object_wal(
+            store.clone(),
+            &label,
+            0,
+            bucket.clone(),
+            "g.wal",
+        )
+        .await
+        .unwrap();
+        assert_eq!(2, b.pending_ops().await);
+        let head = b.head().await;
+        assert!(head.value_triple_exists(&vt("x", "p", "1")));
+        assert!(head.value_triple_exists(&vt("y", "p", "2")));
+
+        // flush persists them and checkpoints the WAL
+        b.flush().await.unwrap().unwrap();
+        let persisted = store
+            .open(&label)
+            .await
+            .unwrap()
+            .unwrap()
+            .head()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(persisted.value_triple_exists(&vt("x", "p", "1")));
+        assert!(persisted.value_triple_exists(&vt("y", "p", "2")));
+
+        // reopening again recovers nothing — no double-apply
+        let b3 = BufferedNamedGraph::open_with_object_wal(
+            store.clone(),
+            &label,
+            0,
+            bucket.clone(),
+            "g.wal",
+        )
+        .await
+        .unwrap();
         assert_eq!(0, b3.pending_ops().await);
     }
 }

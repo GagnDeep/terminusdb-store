@@ -265,6 +265,122 @@ impl Wal for FileWal {
     }
 }
 
+/// A [`Wal`] whose records live in an object store instead of on local disk, so
+/// durable group commit needs **no local disk** (matching the disk-less read
+/// path). Each appended op is one small immutable object keyed by a monotonic
+/// sequence, so a successful PUT is the durability point — the object-store
+/// analogue of an fsync, and atomic, so there is no torn-tail to tolerate.
+/// Replay lists and reads them in order; checkpoint deletes them.
+///
+/// Single-logical-writer per label (the same model the label compare-and-swap
+/// assumes), so the in-memory sequence counter needs no cross-process locking; on
+/// open it resumes past whatever objects survive.
+#[cfg(feature = "object-store")]
+pub struct ObjectWal {
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: String,
+    next_seq: Mutex<u64>,
+}
+
+#[cfg(feature = "object-store")]
+impl ObjectWal {
+    /// Open (or resume) an object-backed WAL under `prefix` in `store`. Records
+    /// are objects `"<prefix>/<seq>"`; the sequence resumes past any survivors.
+    pub async fn open(
+        store: std::sync::Arc<dyn object_store::ObjectStore>,
+        prefix: impl Into<String>,
+    ) -> io::Result<Self> {
+        let mut prefix = prefix.into();
+        while prefix.ends_with('/') {
+            prefix.pop();
+        }
+        let wal = Self {
+            store,
+            prefix,
+            next_seq: Mutex::new(0),
+        };
+        let seqs = wal.list_seqs().await?;
+        *wal.next_seq.lock().await = seqs.last().map_or(0, |&s| s + 1);
+        Ok(wal)
+    }
+
+    fn key(&self, seq: u64) -> object_store::path::Path {
+        object_store::path::Path::from(format!("{}/{:020}", self.prefix, seq))
+    }
+
+    /// The sequence numbers currently present, ascending.
+    async fn list_seqs(&self) -> io::Result<Vec<u64>> {
+        use futures::stream::StreamExt;
+        let prefix = object_store::path::Path::from(self.prefix.as_str());
+        let mut stream = self.store.list(Some(&prefix));
+        let mut seqs = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(os_to_io)?;
+            if let Some(seq) = meta.location.filename().and_then(|n| n.parse::<u64>().ok()) {
+                seqs.push(seq);
+            }
+        }
+        seqs.sort_unstable();
+        Ok(seqs)
+    }
+}
+
+#[cfg(feature = "object-store")]
+fn os_to_io(e: object_store::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e.to_string())
+}
+
+#[cfg(feature = "object-store")]
+#[async_trait]
+impl Wal for ObjectWal {
+    async fn append(&self, record: &WalRecord) -> io::Result<()> {
+        let seq = {
+            let mut g = self.next_seq.lock().await;
+            let s = *g;
+            *g += 1;
+            s
+        };
+        let payload = encode_payload(record).freeze();
+        let opts = object_store::PutOptions::from(object_store::PutMode::Create);
+        self.store
+            .put_opts(&self.key(seq), payload.into(), opts)
+            .await
+            .map_err(os_to_io)?;
+        Ok(())
+    }
+
+    async fn replay(&self) -> io::Result<Vec<WalRecord>> {
+        let seqs = self.list_seqs().await?;
+        let mut out = Vec::with_capacity(seqs.len());
+        for seq in seqs {
+            let bytes = self
+                .store
+                .get(&self.key(seq))
+                .await
+                .map_err(os_to_io)?
+                .bytes()
+                .await
+                .map_err(os_to_io)?;
+            // An object is exactly one payload (atomic PUT), so no framing.
+            if let Some(record) = decode_payload(&bytes) {
+                out.push(record);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn checkpoint(&self) -> io::Result<()> {
+        for seq in self.list_seqs().await? {
+            match self.store.delete(&self.key(seq)).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(os_to_io(e)),
+            }
+        }
+        *self.next_seq.lock().await = 0;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +442,35 @@ mod tests {
 
         // and it is usable again after checkpoint
         wal.append(&add("c", "p", "3")).await.unwrap();
+        assert_eq!(1, wal.replay().await.unwrap().len());
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn object_wal_append_replay_checkpoint_and_survives_reopen() {
+        use object_store::memory::InMemory;
+        use std::sync::Arc;
+
+        let bucket: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let wal = ObjectWal::open(bucket.clone(), "g.wal").await.unwrap();
+
+        wal.append(&add("a", "p", "1")).await.unwrap();
+        wal.append(&add("b", "p", "2")).await.unwrap();
+        wal.append(&remove_node("c", "likes", "d")).await.unwrap();
+        let replayed = wal.replay().await.unwrap();
+        assert_eq!(3, replayed.len());
+        // order is preserved
+        assert_eq!(vec![add("a", "p", "1"), add("b", "p", "2")], replayed[..2]);
+
+        // survives reopen (records live in the bucket, not local disk)
+        drop(wal);
+        let wal = ObjectWal::open(bucket.clone(), "g.wal").await.unwrap();
+        assert_eq!(3, wal.replay().await.unwrap().len());
+
+        // checkpoint clears it, and it resumes cleanly afterward
+        wal.checkpoint().await.unwrap();
+        assert_eq!(0, wal.replay().await.unwrap().len());
+        wal.append(&add("e", "p", "5")).await.unwrap();
         assert_eq!(1, wal.replay().await.unwrap().len());
     }
 
