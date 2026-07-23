@@ -918,6 +918,86 @@ mod tests {
         );
     }
 
+    /// Phase 3, Stage 1a: a selective (adjacency-only) existence check transfers
+    /// far fewer bytes than a full `get_layer`, because it never fetches the
+    /// (large) dictionary, object index, or wavelet tree.
+    #[tokio::test]
+    async fn selective_exists_transfers_less_than_full_layer() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let head = {
+            let store = crate::store::open_object_store(bucket.clone(), "", 100);
+            let db = store.create("g").await.unwrap();
+            let builder = store.create_base_layer().await.unwrap();
+            for i in 0..3000 {
+                builder
+                    .add_value_triple(ValueTriple::new_string_value(
+                        &format!("s{}", i),
+                        "p",
+                        &format!("o{}", i),
+                    ))
+                    .unwrap();
+            }
+            let layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+            layer.name()
+        };
+
+        // Resolve one existing triple to ids (uncounted).
+        let target = ValueTriple::new_string_value("s10", "p", "o10");
+        let idt = {
+            let store = crate::store::open_object_store(bucket.clone(), "", 100);
+            let l = store.get_layer_from_id(head).await.unwrap().unwrap();
+            l.value_triple_to_id(&target).unwrap()
+        };
+
+        // Measure the selective existence check on a fresh, cold, RAM-cache-off
+        // store (so reads are ranged, not whole-archive).
+        let c_sel = Arc::new(AtomicU64::new(0));
+        let s_sel = crate::store::open_object_store(
+            Arc::new(CountingStore {
+                inner: bucket.clone(),
+                ranged_bytes: c_sel.clone(),
+            }),
+            "",
+            0,
+        );
+        assert!(s_sel.selective_id_triple_exists(head, idt).await.unwrap());
+        let selective = c_sel.load(Ordering::Relaxed);
+
+        // Measure a full get_layer + existence check the same way.
+        let c_full = Arc::new(AtomicU64::new(0));
+        let s_full = crate::store::open_object_store(
+            Arc::new(CountingStore {
+                inner: bucket.clone(),
+                ranged_bytes: c_full.clone(),
+            }),
+            "",
+            0,
+        );
+        assert!(s_full
+            .get_layer_from_id(head)
+            .await
+            .unwrap()
+            .unwrap()
+            .value_triple_exists(&target));
+        let full = c_full.load(Ordering::Relaxed);
+
+        println!(
+            "selective exists = {} bytes; full get_layer = {} bytes ({:.0}% of full)",
+            selective,
+            full,
+            selective as f64 / full as f64 * 100.0
+        );
+        assert!(
+            selective < full,
+            "selective existence ({}) must transfer less than a full layer read ({})",
+            selective,
+            full
+        );
+    }
+
     // ---- Milestone 2: write path — commit a chain, drop, reopen, read back ----
 
     // Persist a committed layer to the backing store. `commit_boxed` only fills

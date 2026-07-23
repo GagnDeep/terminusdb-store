@@ -867,6 +867,45 @@ impl Store {
         Ok(layer.map(|layer| StoreLayer::wrap(layer, self.clone())))
     }
 
+    /// Check whether an id-level triple exists in the graph headed by `head`,
+    /// loading only the adjacency structures of each layer rather than
+    /// materializing whole layers. This is the low-memory / disk-less read path:
+    /// it never fetches dictionaries, object indexes, or wavelet trees, so on a
+    /// disk-less replica it transfers and holds far fewer bytes than a full
+    /// `get_layer`.
+    ///
+    /// The ids must already be resolved in `head`'s numbering (e.g. via a layer's
+    /// `value_triple_to_id`). Correct regardless of rollups: it consults the
+    /// authoritative parent chain, whose per-layer additions/removals are the
+    /// ground truth a rollup is only derived from. (Phase 3, Stage 1a; string
+    /// resolution via selective dictionary loading is a later increment.)
+    pub async fn selective_id_triple_exists(
+        &self,
+        head: [u32; 5],
+        triple: IdTriple,
+    ) -> io::Result<bool> {
+        // `retrieve_layer_stack_names` returns the chain base-first; walk it
+        // head-first so the newest layer that mentions the triple wins.
+        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        for &layer in chain.iter().rev() {
+            if self
+                .layer_store
+                .triple_addition_exists(layer, triple.subject, triple.predicate, triple.object)
+                .await?
+            {
+                return Ok(true);
+            }
+            if self
+                .layer_store
+                .triple_removal_exists(layer, triple.subject, triple.predicate, triple.object)
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(false)
+    }
+
     /// Spawn a background task that keeps read depth bounded: every `interval`
     /// it rolls up (non-destructively) any label head whose effective layer
     /// stack exceeds `max_depth`. Returns the task handle; abort it to stop.
@@ -1127,6 +1166,56 @@ mod tests {
         let store = open_archive_store(dir.path(), 100);
         let layer = store.get_layer_from_id(name).await.unwrap().unwrap();
         assert!(layer.value_triple_exists(&ValueTriple::new_string_value("cow", "says", "moo")));
+    }
+
+    #[tokio::test]
+    async fn selective_id_triple_exists_matches_full_layer() {
+        // Build a chain that exercises add, remove-of-a-base-triple, and re-add.
+        let store = open_memory_store();
+        let db = store.create("g").await.unwrap();
+
+        let vs = |s, p, o| ValueTriple::new_string_value(s, p, o);
+        let vn = |s, p, o| ValueTriple::new_node(s, p, o);
+
+        let builder = store.create_base_layer().await.unwrap();
+        builder.add_value_triple(vs("a", "p", "1")).unwrap();
+        builder.add_value_triple(vs("b", "p", "2")).unwrap();
+        builder.add_value_triple(vn("a", "links", "b")).unwrap();
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        let builder = layer.open_write().await.unwrap();
+        builder.add_value_triple(vs("c", "p", "3")).unwrap();
+        builder.remove_value_triple(vs("a", "p", "1")).unwrap(); // remove a base triple
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        let builder = layer.open_write().await.unwrap();
+        builder.add_value_triple(vs("a", "p", "1")).unwrap(); // re-add it
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        // Ground truth via the fully-materialized layer.
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+
+        // A mix of present and absent (but resolvable) triples.
+        let candidates = [
+            vs("a", "p", "1"),     // removed then re-added -> exists
+            vs("b", "p", "2"),     // base -> exists
+            vs("c", "p", "3"),     // added -> exists
+            vn("a", "links", "b"), // node -> exists
+            vs("a", "p", "2"),     // strings all exist, triple does not -> absent
+            vs("b", "p", "3"),     // absent
+        ];
+        for cand in &candidates {
+            let expected = full.value_triple_exists(cand);
+            let idt = full
+                .value_triple_to_id(cand)
+                .expect("all strings in these candidates exist in the dictionary");
+            let got = store.selective_id_triple_exists(head, idt).await.unwrap();
+            assert_eq!(expected, got, "mismatch for {:?}", cand);
+        }
     }
 
     #[tokio::test]
