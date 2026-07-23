@@ -26,8 +26,10 @@
 
 use std::io;
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use lru::LruCache;
 use tdb_succinct::block::{IdLookupResult, SizedDictBlock};
@@ -38,11 +40,54 @@ use super::consts::LayerFileEnum;
 
 const BLOCK_SIZE: usize = 8;
 
+/// The minimal, object-safe read seam a block-lazy dictionary needs: read a
+/// whole small structure (the offset table), report a structure's byte size,
+/// and read an arbitrary byte range of a structure (one block). Blanket-
+/// implemented for any backend that is both an [`ArchiveBackend`] and an
+/// [`ArchiveMetadataBackend`], and also implemented by `ArchiveLayerStore` so a
+/// `dyn LayerStore` can hand one out without exposing its backend type.
+#[async_trait]
+pub trait BlockSource: Send + Sync {
+    async fn structure_bytes(
+        &self,
+        layer: [u32; 5],
+        file: LayerFileEnum,
+    ) -> io::Result<Option<Bytes>>;
+    async fn structure_size(&self, layer: [u32; 5], file: LayerFileEnum) -> io::Result<usize>;
+    async fn structure_range(
+        &self,
+        layer: [u32; 5],
+        file: LayerFileEnum,
+        range: Range<usize>,
+    ) -> io::Result<Bytes>;
+}
+
+#[async_trait]
+impl<T: ArchiveBackend + ArchiveMetadataBackend> BlockSource for T {
+    async fn structure_bytes(
+        &self,
+        layer: [u32; 5],
+        file: LayerFileEnum,
+    ) -> io::Result<Option<Bytes>> {
+        self.get_layer_structure_bytes(layer, file).await
+    }
+    async fn structure_size(&self, layer: [u32; 5], file: LayerFileEnum) -> io::Result<usize> {
+        self.get_layer_structure_size(layer, file).await
+    }
+    async fn structure_range(
+        &self,
+        layer: [u32; 5],
+        file: LayerFileEnum,
+        range: Range<usize>,
+    ) -> io::Result<Bytes> {
+        self.get_layer_structure_range(layer, file, range).await
+    }
+}
+
 /// A dictionary reader that fetches one data block per lookup instead of the
-/// whole dictionary. `B` is any backend that can read structure byte-ranges and
-/// report structure sizes (e.g. the object-store backend).
-pub struct BlockLazyStringDict<B> {
-    backend: B,
+/// whole dictionary, over any [`BlockSource`] (e.g. the object-store backend).
+pub struct BlockLazyStringDict {
+    source: Arc<dyn BlockSource>,
     layer: [u32; 5],
     blocks_file: LayerFileEnum,
     /// Resident offset table: `offsets.entry(i)` is the byte offset in the data
@@ -55,31 +100,25 @@ pub struct BlockLazyStringDict<B> {
     block_cache: Mutex<LruCache<usize, Bytes>>,
 }
 
-impl<B: ArchiveBackend + ArchiveMetadataBackend> BlockLazyStringDict<B> {
+impl BlockLazyStringDict {
     /// Open a block-lazy view over the dictionary whose offset table and data
     /// section are the given layer structures. Loads only the (small) offset
     /// table and the data-section size — not the data itself.
     pub async fn open(
-        backend: B,
+        source: Arc<dyn BlockSource>,
         layer: [u32; 5],
         offsets_file: LayerFileEnum,
         blocks_file: LayerFileEnum,
     ) -> io::Result<Self> {
-        let offsets = match backend
-            .get_layer_structure_bytes(layer, offsets_file)
-            .await?
-        {
+        let offsets = match source.structure_bytes(layer, offsets_file).await? {
             Some(b) if !b.is_empty() => Some(MonotonicLogArray::parse(b).map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("offsets: {:?}", e))
             })?),
             _ => None,
         };
-        let data_len = backend
-            .get_layer_structure_size(layer, blocks_file)
-            .await
-            .unwrap_or(0);
+        let data_len = source.structure_size(layer, blocks_file).await.unwrap_or(0);
         Ok(Self {
-            backend,
+            source,
             layer,
             blocks_file,
             offsets,
@@ -120,8 +159,8 @@ impl<B: ArchiveBackend + ArchiveMetadataBackend> BlockLazyStringDict<B> {
             None => {
                 let (start, end) = self.block_range(block_index);
                 let fetched = self
-                    .backend
-                    .get_layer_structure_range(self.layer, self.blocks_file, start..end)
+                    .source
+                    .structure_range(self.layer, self.blocks_file, start..end)
                     .await?;
                 self.block_cache
                     .lock()
@@ -234,7 +273,7 @@ mod tests {
         assert!(n > 8, "expected several blocks");
 
         let lazy = BlockLazyStringDict::open(
-            backend,
+            Arc::new(backend) as Arc<dyn BlockSource>,
             name,
             LayerFileEnum::NodeDictionaryOffsets,
             LayerFileEnum::NodeDictionaryBlocks,
