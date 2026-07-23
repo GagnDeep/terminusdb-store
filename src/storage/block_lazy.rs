@@ -445,6 +445,50 @@ impl BlockLazyTypedDict {
         // Compose with the segment's id offset, as `TypedDict::id_slice` does.
         Ok(seg_result.offset(id_offset).into_option())
     }
+
+    /// The datatype segment a value-dictionary-local id belongs to (mirrors
+    /// `TypedDict::type_index_for_id`).
+    fn type_index_for_id(&self, id: u64) -> usize {
+        for (ix, offset) in self.type_id_offsets.iter().enumerate() {
+            if *offset > id - 1 {
+                return ix;
+            }
+        }
+        self.type_id_offsets.len()
+    }
+
+    /// The typed value for a value-dictionary-local `id`, fetching only the block
+    /// that holds it — the same value as `TypedDict::entry(id)`. `None` if out of
+    /// range.
+    pub async fn entry(&self, id: u64) -> io::Result<Option<TypedDictEntry>> {
+        if id == 0 || self.types_present.is_empty() {
+            return Ok(None);
+        }
+        let type_index = self.type_index_for_id(id);
+        if type_index >= self.types_present.len() {
+            return Ok(None);
+        }
+        let (seg_start, num_blocks, id_offset) = self.segment(type_index);
+        if id <= id_offset {
+            return Ok(None);
+        }
+        // 1-based position within the segment, then block + offset within block.
+        let p = (id - id_offset) as usize;
+        let block_in_seg = (p - 1) / BLOCK_SIZE;
+        let pos_in_block = (p - 1) % BLOCK_SIZE;
+        if block_in_seg >= num_blocks {
+            return Ok(None);
+        }
+        let block = self.get_block(seg_start + block_in_seg).await?;
+        if pos_in_block >= block.num_entries() as usize {
+            return Ok(None);
+        }
+        let dt = <tdb_succinct::Datatype as num_traits::FromPrimitive>::from_u64(
+            self.types_present.entry(type_index),
+        )
+        .expect("value dictionary has an unknown datatype discriminant");
+        Ok(Some(TypedDictEntry::new(dt, block.entry(pos_in_block))))
+    }
 }
 
 /// A block-lazy reader for a `LogArray` — random access to a single bit-packed
@@ -719,6 +763,21 @@ mod tests {
                 e.datatype()
             );
         }
+
+        // Reverse direction: every id resolves to the same typed value as the
+        // full dictionary, one block fetched at a time.
+        let n = full.num_entries() as u64;
+        assert!(n > 24, "expected several entries across datatypes");
+        for id in 1..=n {
+            assert_eq!(
+                full.entry(id as usize),
+                lazy.entry(id).await.unwrap(),
+                "entry {}",
+                id
+            );
+        }
+        assert_eq!(None, lazy.entry(0).await.unwrap());
+        assert_eq!(None, lazy.entry(n + 1).await.unwrap());
     }
 
     #[tokio::test]
