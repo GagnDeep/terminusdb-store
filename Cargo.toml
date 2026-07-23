@@ -43,3 +43,7 @@ object_store = { version = "0.11", optional = true, features = ["aws", "gcp", "a
 noreadlock = []
 eprint_log = []
 object-store = ["dep:object_store"]
+
+[[example]]
+name = "object_store_graph"
+required-features = ["object-store"]

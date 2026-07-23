@@ -40,3 +40,5 @@ pub mod store;
 pub use layer::{IdTriple, Layer, ObjectType, ValueTriple};
 pub use store::sync::{open_sync_archive_store, open_sync_directory_store, open_sync_memory_store};
 pub use store::{open_archive_store, open_directory_store, open_memory_store};
+#[cfg(feature = "object-store")]
+pub use store::{open_object_store, open_object_store_with_cache};
