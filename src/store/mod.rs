@@ -1004,12 +1004,12 @@ impl Store {
                 #[cfg(feature = "object-store")]
                 {
                     if let Some(src) = &block_source {
-                        (
-                            self.block_lazy_sign_exists(src, layer, &ADJ_POS, triple)
-                                .await?,
-                            self.block_lazy_sign_exists(src, layer, &ADJ_NEG, triple)
-                                .await?,
-                        )
+                        // Additions and removals index independently — check both
+                        // concurrently.
+                        futures::try_join!(
+                            self.block_lazy_sign_exists(src, layer, &ADJ_POS, triple),
+                            self.block_lazy_sign_exists(src, layer, &ADJ_NEG, triple),
+                        )?
                     } else {
                         (
                             self.layer_store
@@ -1209,7 +1209,8 @@ impl Store {
             return Ok(false);
         }
 
-        // Load a bit index whole (bits + rank/select samples are small). Absence
+        // Load a bit index whole (bits + rank/select samples are small); its
+        // three structures are independent, so fetch them concurrently. Absence
         // of the bits structure means this signed index does not exist here.
         async fn bit_index(
             src: &std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>,
@@ -1218,50 +1219,59 @@ impl Store {
             blocks: crate::storage::consts::LayerFileEnum,
             sblocks: crate::storage::consts::LayerFileEnum,
         ) -> io::Result<Option<BitIndex>> {
-            let bits = match src.structure_bytes(layer, bits).await? {
+            let (bits, blocks, sblocks) = futures::try_join!(
+                src.structure_bytes(layer, bits),
+                src.structure_bytes(layer, blocks),
+                src.structure_bytes(layer, sblocks),
+            )?;
+            let bits = match bits {
                 Some(b) if !b.is_empty() => b,
                 _ => return Ok(None),
             };
-            let blocks = src
-                .structure_bytes(layer, blocks)
-                .await?
-                .unwrap_or_default();
-            let sblocks = src
-                .structure_bytes(layer, sblocks)
-                .await?
-                .unwrap_or_default();
-            Ok(Some(BitIndex::from_maps(bits, blocks, sblocks)))
+            Ok(Some(BitIndex::from_maps(
+                bits,
+                blocks.unwrap_or_default(),
+                sblocks.unwrap_or_default(),
+            )))
         }
 
-        let sp_bits =
-            match bit_index(src, layer, files.sp_bits, files.sp_blocks, files.sp_sblocks).await? {
-                Some(b) => b,
-                None => return Ok(false),
-            };
-        let spo_bits = match bit_index(
-            src,
-            layer,
-            files.spo_bits,
-            files.spo_blocks,
-            files.spo_sblocks,
-        )
-        .await?
-        {
+        let subjects_fut = async {
+            // Optional subject id-map (present on child layers; absent on base,
+            // where the subject id is used directly).
+            Ok::<Option<MonotonicLogArray>, io::Error>(
+                match src.structure_bytes(layer, files.subjects).await? {
+                    Some(b) if !b.is_empty() => Some(MonotonicLogArray::parse(b).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("subjects: {:?}", e))
+                    })?),
+                    _ => None,
+                },
+            )
+        };
+
+        // All the setup reads for this signed index are independent — fetch the
+        // two bit indexes, the two nums openers, and the subjects array in one
+        // concurrent wave rather than sequentially.
+        let (sp_bits_opt, spo_bits_opt, sp_nums, spo_nums, subjects) = futures::try_join!(
+            bit_index(src, layer, files.sp_bits, files.sp_blocks, files.sp_sblocks),
+            bit_index(
+                src,
+                layer,
+                files.spo_bits,
+                files.spo_blocks,
+                files.spo_sblocks
+            ),
+            BlockLazyLogArray::open(src.clone(), layer, files.sp_nums),
+            BlockLazyLogArray::open(src.clone(), layer, files.spo_nums),
+            subjects_fut,
+        )?;
+        let sp_bits = match sp_bits_opt {
             Some(b) => b,
             None => return Ok(false),
         };
-        let sp_nums = BlockLazyLogArray::open(src.clone(), layer, files.sp_nums).await?;
-        let spo_nums = BlockLazyLogArray::open(src.clone(), layer, files.spo_nums).await?;
-
-        // Optional subject id-map (present on child layers; absent on base, where
-        // the subject id is used directly).
-        let subjects: Option<MonotonicLogArray> =
-            match src.structure_bytes(layer, files.subjects).await? {
-                Some(b) if !b.is_empty() => Some(MonotonicLogArray::parse(b).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("subjects: {:?}", e))
-                })?),
-                _ => None,
-            };
+        let spo_bits = match spo_bits_opt {
+            Some(b) => b,
+            None => return Ok(false),
+        };
 
         // `AdjacencyList::offset_for(index)`.
         let offset_for = |bits: &BitIndex, index: u64| -> u64 {
@@ -1335,56 +1345,60 @@ impl Store {
         head: [u32; 5],
         triple: &ValueTriple,
     ) -> io::Result<bool> {
-        use tdb_succinct::TypedDictEntry;
-
         // chain is base-first; compute the cumulative node+value and predicate
         // counts *below* each layer (the global-id offset for entries it owns).
+        // The per-layer counts are independent, so fetch them all concurrently.
         let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
         let ls = &self.layer_store;
+        let counts = futures::future::try_join_all(chain.iter().map(|&layer| async move {
+            let (n, v, p) = futures::try_join!(
+                ls.get_node_count(layer),
+                ls.get_value_count(layer),
+                ls.get_predicate_count(layer),
+            )?;
+            Ok::<_, io::Error>((n.unwrap_or(0) + v.unwrap_or(0), p.unwrap_or(0)))
+        }))
+        .await?;
         let mut off_nv = Vec::with_capacity(chain.len());
         let mut off_pred = Vec::with_capacity(chain.len());
         let (mut cum_nv, mut cum_pred) = (0u64, 0u64);
-        for &layer in &chain {
+        for (nv, pred) in counts {
             off_nv.push(cum_nv);
             off_pred.push(cum_pred);
-            cum_nv += ls.get_node_count(layer).await?.unwrap_or(0)
-                + ls.get_value_count(layer).await?.unwrap_or(0);
-            cum_pred += ls.get_predicate_count(layer).await?.unwrap_or(0);
+            cum_nv += nv;
+            cum_pred += pred;
         }
 
-        // Resolve subject and predicate. `resolve_dict_id` uses block-lazy
-        // dictionaries when the backend supports ranged reads, otherwise the
-        // whole-dictionary path — identical results either way.
-        let subject = match self
-            .resolve_dict_id(&chain, &off_nv, DictKind::Node, &triple.subject)
-            .await?
-        {
-            Some(id) => id,
-            None => return Ok(false),
+        // Subject, predicate and object resolve independently — walk their three
+        // chains concurrently. `resolve_dict_id` uses block-lazy dictionaries when
+        // the backend supports ranged reads, otherwise the whole-dictionary path.
+        let (subject, predicate, object) = futures::try_join!(
+            self.resolve_dict_id(&chain, &off_nv, DictKind::Node, &triple.subject),
+            self.resolve_dict_id(&chain, &off_pred, DictKind::Predicate, &triple.predicate),
+            self.resolve_object_id(&chain, &off_nv, &triple.object),
+        )?;
+        let (subject, predicate, object) = match (subject, predicate, object) {
+            (Some(s), Some(p), Some(o)) => (s, p, o),
+            _ => return Ok(false),
         };
 
-        let predicate = match self
-            .resolve_dict_id(&chain, &off_pred, DictKind::Predicate, &triple.predicate)
-            .await?
-        {
-            Some(id) => id,
-            None => return Ok(false),
-        };
+        self.selective_id_triple_exists(head, IdTriple::new(subject, predicate, object))
+            .await
+    }
 
-        // Resolve the object (node or typed value).
-        let object = match &triple.object {
-            ObjectType::Node(n) => {
-                match self
-                    .resolve_dict_id(&chain, &off_nv, DictKind::Node, n)
-                    .await?
-                {
-                    Some(id) => id,
-                    None => return Ok(false),
-                }
-            }
+    /// Resolve a triple object (node or typed value) to its global id, walking
+    /// the chain head-first. See [`resolve_dict_id`](Self::resolve_dict_id) and
+    /// [`resolve_value_local_id`](Self::resolve_value_local_id).
+    async fn resolve_object_id(
+        &self,
+        chain: &[[u32; 5]],
+        off_nv: &[u64],
+        object: &ObjectType,
+    ) -> io::Result<Option<u64>> {
+        match object {
+            ObjectType::Node(n) => self.resolve_dict_id(chain, off_nv, DictKind::Node, n).await,
             ObjectType::Value(v) => {
-                let v: &TypedDictEntry = v;
-                let mut found = None;
+                let ls = &self.layer_store;
                 for i in (0..chain.len()).rev() {
                     if let Some(local) = self.resolve_value_local_id(chain[i], v).await? {
                         // values live above this layer's nodes in the id-map's
@@ -1395,19 +1409,12 @@ impl Store {
                             Some(m) => m.inner_to_outer(combined),
                             None => combined,
                         };
-                        found = Some(outer + off_nv[i]);
-                        break;
+                        return Ok(Some(outer + off_nv[i]));
                     }
                 }
-                match found {
-                    Some(id) => id,
-                    None => return Ok(false),
-                }
+                Ok(None)
             }
-        };
-
-        self.selective_id_triple_exists(head, IdTriple::new(subject, predicate, object))
-            .await
+        }
     }
 
     /// All id-triples with subject `subject` in the graph headed by `head`,

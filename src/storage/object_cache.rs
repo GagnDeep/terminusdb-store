@@ -518,6 +518,69 @@ mod tests {
         println!("=================================================================\n");
     }
 
+    /// Wall-clock latency of a selective existence query that walks a whole
+    /// layer chain (an absent-but-resolvable triple), under simulated RTT. Shows
+    /// the effect of issuing each layer's independent structure reads
+    /// concurrently rather than sequentially. Ignored by default (it sleeps).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn bench_selective_existence_latency() {
+        use crate::store::open_object_store;
+        use std::sync::atomic::Ordering::Relaxed;
+        const DEPTH: usize = 12;
+        let rtt = Duration::from_millis(5);
+
+        // Build a chain into a latency-free bucket: base has (root,p,0), each
+        // child i adds (s{i},p,o{i}).
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let head = {
+            let store = open_object_store(bucket.clone(), "", 1 << 30);
+            let db = store.create("g").await.unwrap();
+            let builder = store.create_base_layer().await.unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_string_value("root", "p", "0"))
+                .unwrap();
+            let mut layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+            for i in 1..DEPTH {
+                let b = layer.open_write().await.unwrap();
+                b.add_value_triple(ValueTriple::new_string_value(
+                    &format!("s{}", i),
+                    "p",
+                    &format!("o{}", i),
+                ))
+                .unwrap();
+                layer = b.commit().await.unwrap();
+                db.set_head(&layer).await.unwrap();
+            }
+            layer.name()
+        };
+        // Resolvable (root, p, o5 all exist) but the triple does not, forcing the
+        // walk to visit every layer's adjacency.
+        let target = ValueTriple::new_string_value("root", "p", "o5");
+
+        let ls = LatencyStore::new(bucket.clone(), rtt);
+        let larch = ls.larch.clone();
+        let slow: Arc<dyn ObjectStore> = Arc::new(ls);
+        let store = open_object_store(slow, "", 0); // cache 0 -> every read is a slow GET
+
+        let t = Instant::now();
+        let exists = store
+            .selective_value_triple_exists(head, &target)
+            .await
+            .unwrap();
+        let elapsed = t.elapsed();
+        assert!(!exists);
+
+        println!(
+            "\n=== selective existence walk, {} layers, {:?} simulated RTT ===",
+            DEPTH, rtt
+        );
+        println!("elapsed: {:?}", elapsed);
+        println!("structure GETs (.larch): {}", larch.load(Relaxed));
+        println!("=================================================================\n");
+    }
+
     // ---- Phase 0B: mmap-backed reads / larger-than-RAM ----
 
     // A layer store whose in-memory LRU budget is `mem_mib` MiB, over an mmap'd
