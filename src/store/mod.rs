@@ -1386,6 +1386,260 @@ impl Store {
             .await
     }
 
+    /// Compute, disk-lessly, the per-layer id-offset context a reverse (id →
+    /// string) resolution needs: the chain (base-first), the cumulative node+value
+    /// offset below each layer, each layer's node count (to split node vs value),
+    /// the cumulative predicate offset, and each layer's predicate count. Counts
+    /// are fetched concurrently.
+    async fn chain_offsets(
+        &self,
+        head: [u32; 5],
+    ) -> io::Result<(Vec<[u32; 5]>, Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>)> {
+        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let ls = &self.layer_store;
+        let counts = futures::future::try_join_all(chain.iter().map(|&layer| async move {
+            let (n, v, p) = futures::try_join!(
+                ls.get_node_count(layer),
+                ls.get_value_count(layer),
+                ls.get_predicate_count(layer),
+            )?;
+            Ok::<_, io::Error>((n.unwrap_or(0), v.unwrap_or(0), p.unwrap_or(0)))
+        }))
+        .await?;
+        let (mut off_nv, mut node_counts, mut off_pred, mut pred_counts) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut cum_nv, mut cum_pred) = (0u64, 0u64);
+        for (n, v, p) in counts {
+            off_nv.push(cum_nv);
+            node_counts.push(n);
+            off_pred.push(cum_pred);
+            pred_counts.push(p);
+            cum_nv += n + v;
+            cum_pred += p;
+        }
+        Ok((chain, off_nv, node_counts, off_pred, pred_counts))
+    }
+
+    /// Locate the owning layer and in-layer (id-map inner) id for a global
+    /// node/value id — the reverse of the `+ off_nv` and `inner_to_outer` used on
+    /// the forward path. Mirrors `InternalLayer::id_subject`/`id_object`.
+    async fn locate_nv(
+        &self,
+        chain: &[[u32; 5]],
+        off_nv: &[u64],
+        id: u64,
+    ) -> io::Result<Option<(usize, u64)>> {
+        let ls = &self.layer_store;
+        for i in (0..chain.len()).rev() {
+            if id > off_nv[i] {
+                let outer = id - off_nv[i];
+                let inner = match ls.get_node_value_idmap(chain[i]).await? {
+                    Some(m) => m.outer_to_inner(outer),
+                    None => outer,
+                };
+                return Ok(Some((i, inner)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The node string for an in-layer (1-based) node id, block-lazy when the
+    /// backend supports ranged reads and the dictionary is large enough.
+    async fn id_to_node_string(
+        &self,
+        layer: [u32; 5],
+        inner: u64,
+        count: u64,
+    ) -> io::Result<Option<String>> {
+        let ls = &self.layer_store;
+        #[cfg(feature = "object-store")]
+        {
+            if count >= BLOCK_LAZY_MIN_ENTRIES {
+                if let Some(src) = ls.block_source() {
+                    use crate::storage::consts::LayerFileEnum;
+                    let d = crate::storage::block_lazy::BlockLazyStringDict::open(
+                        src,
+                        layer,
+                        LayerFileEnum::NodeDictionaryOffsets,
+                        LayerFileEnum::NodeDictionaryBlocks,
+                    )
+                    .await?;
+                    return d.get_string(inner).await;
+                }
+            }
+        }
+        let _ = count;
+        Ok(ls
+            .get_node_dictionary(layer)
+            .await?
+            .and_then(|d| d.get(inner as usize)))
+    }
+
+    /// The typed value for an in-layer (1-based) value id, block-lazy when the
+    /// backend supports ranged reads and the dictionary is large enough.
+    async fn id_to_value(
+        &self,
+        layer: [u32; 5],
+        value_inner: u64,
+        count: u64,
+    ) -> io::Result<Option<tdb_succinct::TypedDictEntry>> {
+        let ls = &self.layer_store;
+        #[cfg(feature = "object-store")]
+        {
+            if count >= BLOCK_LAZY_MIN_ENTRIES {
+                if let Some(src) = ls.block_source() {
+                    use crate::storage::consts::LayerFileEnum;
+                    let d = crate::storage::block_lazy::BlockLazyTypedDict::open(
+                        src,
+                        layer,
+                        LayerFileEnum::ValueDictionaryTypesPresent,
+                        LayerFileEnum::ValueDictionaryTypeOffsets,
+                        LayerFileEnum::ValueDictionaryOffsets,
+                        LayerFileEnum::ValueDictionaryBlocks,
+                    )
+                    .await?;
+                    return d.entry(value_inner).await;
+                }
+            }
+        }
+        let _ = count;
+        Ok(ls
+            .get_value_dictionary(layer)
+            .await?
+            .and_then(|d| d.entry(value_inner as usize)))
+    }
+
+    /// The subject string for a global id, resolved disk-lessly. Mirrors
+    /// `Layer::id_subject`. (Phase 3, Stage 4: reverse resolution.)
+    pub async fn selective_id_subject(
+        &self,
+        head: [u32; 5],
+        id: u64,
+    ) -> io::Result<Option<String>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        let (chain, off_nv, node_counts, _, _) = self.chain_offsets(head).await?;
+        match self.locate_nv(&chain, &off_nv, id).await? {
+            Some((i, inner)) => {
+                self.id_to_node_string(chain[i], inner, node_counts[i])
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The predicate string for a global id, resolved disk-lessly. Mirrors
+    /// `Layer::id_predicate`.
+    pub async fn selective_id_predicate(
+        &self,
+        head: [u32; 5],
+        id: u64,
+    ) -> io::Result<Option<String>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        let ls = &self.layer_store;
+        let (chain, _, _, off_pred, pred_counts) = self.chain_offsets(head).await?;
+        for i in (0..chain.len()).rev() {
+            if id > off_pred[i] {
+                let outer = id - off_pred[i];
+                let inner = match ls.get_predicate_idmap(chain[i]).await? {
+                    Some(m) => m.outer_to_inner(outer),
+                    None => outer,
+                };
+                // predicate dictionary reuses the node-string block-lazy path.
+                return self
+                    .id_to_pred_string(chain[i], inner, pred_counts[i])
+                    .await;
+            }
+        }
+        Ok(None)
+    }
+
+    async fn id_to_pred_string(
+        &self,
+        layer: [u32; 5],
+        inner: u64,
+        count: u64,
+    ) -> io::Result<Option<String>> {
+        let ls = &self.layer_store;
+        #[cfg(feature = "object-store")]
+        {
+            if count >= BLOCK_LAZY_MIN_ENTRIES {
+                if let Some(src) = ls.block_source() {
+                    use crate::storage::consts::LayerFileEnum;
+                    let d = crate::storage::block_lazy::BlockLazyStringDict::open(
+                        src,
+                        layer,
+                        LayerFileEnum::PredicateDictionaryOffsets,
+                        LayerFileEnum::PredicateDictionaryBlocks,
+                    )
+                    .await?;
+                    return d.get_string(inner).await;
+                }
+            }
+        }
+        let _ = count;
+        Ok(ls
+            .get_predicate_dictionary(layer)
+            .await?
+            .and_then(|d| d.get(inner as usize)))
+    }
+
+    /// The object (node or typed value) for a global id, resolved disk-lessly.
+    /// Mirrors `Layer::id_object`.
+    pub async fn selective_id_object(
+        &self,
+        head: [u32; 5],
+        id: u64,
+    ) -> io::Result<Option<ObjectType>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        let (chain, off_nv, node_counts, _, _) = self.chain_offsets(head).await?;
+        match self.locate_nv(&chain, &off_nv, id).await? {
+            Some((i, inner)) => {
+                let node_len = node_counts[i];
+                if inner > node_len {
+                    // above the node range in this layer -> a value
+                    Ok(self
+                        .id_to_value(chain[i], inner - node_len, node_counts[i])
+                        .await?
+                        .map(ObjectType::Value))
+                } else {
+                    Ok(self
+                        .id_to_node_string(chain[i], inner, node_len)
+                        .await?
+                        .map(ObjectType::Node))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve a whole id-triple back to its string form, disk-lessly. Mirrors
+    /// `Layer::id_triple_to_string`.
+    pub async fn selective_id_triple_to_string(
+        &self,
+        head: [u32; 5],
+        triple: IdTriple,
+    ) -> io::Result<Option<ValueTriple>> {
+        let (s, p, o) = futures::try_join!(
+            self.selective_id_subject(head, triple.subject),
+            self.selective_id_predicate(head, triple.predicate),
+            self.selective_id_object(head, triple.object),
+        )?;
+        Ok(match (s, p, o) {
+            (Some(s), Some(p), Some(o)) => Some(ValueTriple {
+                subject: s,
+                predicate: p,
+                object: o,
+            }),
+            _ => None,
+        })
+    }
+
     /// Resolve a triple object (node or typed value) to its global id, walking
     /// the chain head-first. See [`resolve_dict_id`](Self::resolve_dict_id) and
     /// [`resolve_value_local_id`](Self::resolve_value_local_id).
@@ -1977,6 +2231,104 @@ mod tests {
                 cand, expected
             );
         }
+    }
+
+    // Reverse (id -> string) resolution must match the fully-materialized layer.
+    #[tokio::test]
+    async fn selective_reverse_resolution_matches_full_layer_memory() {
+        reverse_resolution_body(open_memory_store()).await;
+    }
+
+    // Same, over an object store with dictionaries large enough to drive the
+    // block-lazy id -> string / id -> value path.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn selective_reverse_resolution_matches_full_layer_object_block_lazy() {
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        reverse_resolution_body(open_object_store(bucket, "", 1 << 30)).await;
+    }
+
+    async fn reverse_resolution_body(store: Store) {
+        use tdb_succinct::TdbDataType;
+
+        let db = store.create("g").await.unwrap();
+        let vs = |s: &str, o: &str| ValueTriple::new_string_value(s, "p", o);
+        let vn = |s: &str, o: &str| ValueTriple::new_node(s, "rel", o);
+        let vi = |s: &str, i: i32| {
+            ValueTriple::new_value(s, "age", <i32 as TdbDataType>::make_entry(&i))
+        };
+
+        // base: enough distinct nodes and values to cross the block-lazy threshold
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..700 {
+            builder
+                .add_value_triple(vs(&format!("n{:04}", i), &format!("s{:04}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vn(&format!("n{:04}", i), &format!("n{:04}", (i + 1) % 700)))
+                .unwrap();
+            builder
+                .add_value_triple(vi(&format!("n{:04}", i), i))
+                .unwrap();
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        // a child layer, so id-maps and multi-layer offsets are exercised
+        let builder = layer.open_write().await.unwrap();
+        for i in 700..760 {
+            builder
+                .add_value_triple(vs(&format!("n{:04}", i), &format!("s{:04}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vi(&format!("n{:04}", i), i))
+                .unwrap();
+        }
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+        let triples: Vec<IdTriple> = full.triples().collect();
+        assert!(triples.len() > 1000);
+
+        // Sample across the id space (resolving every triple is O(chain) each).
+        for t in triples.iter().step_by(29) {
+            assert_eq!(
+                full.id_subject(t.subject),
+                store.selective_id_subject(head, t.subject).await.unwrap(),
+                "id_subject {}",
+                t.subject
+            );
+            assert_eq!(
+                full.id_predicate(t.predicate),
+                store
+                    .selective_id_predicate(head, t.predicate)
+                    .await
+                    .unwrap(),
+                "id_predicate {}",
+                t.predicate
+            );
+            assert_eq!(
+                full.id_object(t.object),
+                store.selective_id_object(head, t.object).await.unwrap(),
+                "id_object {}",
+                t.object
+            );
+            assert_eq!(
+                full.id_triple_to_string(t),
+                store.selective_id_triple_to_string(head, *t).await.unwrap(),
+                "id_triple_to_string {:?}",
+                t
+            );
+        }
+        // out-of-range ids resolve to None
+        assert_eq!(None, store.selective_id_subject(head, 0).await.unwrap());
+        assert_eq!(None, store.selective_id_predicate(head, 0).await.unwrap());
+        assert_eq!(
+            None,
+            store.selective_id_object(head, 9_999_999).await.unwrap()
+        );
     }
 
     async fn selective_value_triple_exists_body(store: Store) {
