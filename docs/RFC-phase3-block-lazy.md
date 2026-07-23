@@ -151,12 +151,33 @@ no-fork decision held — `SizedDictBlock::{parse,entry,id,num_entries}` and
     since Stage 1b). The `id -> value` reverse direction still loads the whole dict; it
     is not needed by the selective existence path.
 
-### Stage 3 — block-lazy rank/select (hardest, likely partial)
-- `BitIndex`/`AdjacencyList`/`WaveletTree` do random indexing + data-dependent
-  binary search over resident buffers. Options: keep the small index logarrays
-  (`blocks`/`sblocks`) resident and block-fetch only the bit payload; or a deeper
-  redesign. Expect a partial win here; measure whether it is worth it after Stages
-  1–2.
+### Stage 3 — block-lazy adjacency (done, measure-driven and targeted)
+Profiling a selective value-existence query after Stage 2d (an `#[ignore]`d harness
+attributing every transferred byte to a layer structure) showed the residual was
+**not** dominated by rank/select over the bit indexes but by the adjacency **`nums`
+LogArray** — the `sp_o` `nums` alone was ~4.9 KB (~57% of the query), loaded whole for a
+handful of `num_at_pos` lookups, while the bit index (bits + `blocks`/`sblocks` samples)
+was under 500 bytes. So Stage 3 targeted the LogArray, not the bit index.
+
+- **`BlockLazyLogArray`** (done): random access to a single bit-packed `LogArray`
+  element via a ranged read of just the one or two 64-bit words it spans, keeping only
+  the control word (length + width) resident; decoding mirrors `LogArray::entry` exactly
+  (single-word and word-split cases), with a small word cache so a short scan re-reads a
+  shared word at most once. Differential-tested vs `LogArray::entry` over 3 000
+  varied-width entries.
+- **Wired into `selective_id_triple_exists`** via `block_lazy_sign_exists`: the two bit
+  indexes are loaded **whole** (they are small — used for `select1`/`rank1`/`get`), and
+  the large `nums` arrays are read **lazily**, mirroring `layer_triple_exists` /
+  `sp_o_position` exactly (base and child additions share the `Pos*` structures, removals
+  use `Neg*`, an absent signed index → `false`). All existing selective existence/value/
+  randomized differential tests now exercise this path and still match the full layer.
+- **Measured win:** `sp_o` `nums` 4888 → **16 bytes**; total selective transfer **21% →
+  8%** of a full-layer read (**78% → 8%** since Stage 1b).
+- **Deferred (diminishing returns):** the bit indexes are now the largest residual
+  (~1 KB total, all whole-loaded). Making them block-lazy needs true block-lazy
+  `rank1`/`select1` over ranged bit words — the hard rank/select redesign — for a
+  sub-kilobyte gain out of ~3.4 KB. Not worth it at this point; the `nums` LogArray was
+  the high-value, tractable target the profile identified.
 
 ## Recommendation
 
