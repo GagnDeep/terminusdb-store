@@ -17,11 +17,6 @@ use std::{
     task::Poll,
 };
 
-#[cfg(not(target_os = "windows"))]
-use std::os::unix::fs::MetadataExt;
-#[cfg(target_os = "windows")]
-use std::os::windows::fs::MetadataExt;
-
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use lru::LruCache;
@@ -108,6 +103,35 @@ pub trait ArchiveMetadataBackend: Clone + Send + Sync {
     }
 }
 
+/// Owns a memory-map so it can back a [`Bytes`] via `Bytes::from_owner`; slices
+/// derived from that `Bytes` keep the mapping alive by reference count.
+pub(crate) struct MmapOwner(memmap2::Mmap);
+
+impl AsRef<[u8]> for MmapOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Memory-map a file into `Bytes`. An empty file maps to empty `Bytes` (mmap
+/// rejects zero-length maps); a missing file returns the underlying open error.
+///
+/// Blocking (file open + mmap); call via `spawn_blocking` from async code. Only
+/// the pages a caller actually touches become resident, and because layer
+/// archives are content-addressed and immutable the mapping never changes
+/// underneath us.
+pub(crate) fn mmap_file(path: &std::path::Path) -> io::Result<Bytes> {
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(Bytes::new());
+    }
+    // SAFETY: the mapped archive is immutable once written (content-addressed),
+    // so it is never mutated or truncated while mapped.
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    Ok(Bytes::from_owner(MmapOwner(mmap)))
+}
+
 pub struct BytesAsyncReader(Bytes);
 
 impl AsyncRead for BytesAsyncReader {
@@ -161,21 +185,12 @@ impl DirectoryArchiveBackend {
 impl ArchiveBackend for DirectoryArchiveBackend {
     type Read = ArchiveSliceReader;
     async fn get_layer_bytes(&self, id: [u32; 5]) -> io::Result<Bytes> {
+        // Memory-map instead of reading the whole archive into the heap, so only
+        // the pages actually touched become resident (page-cache buffer pool).
         let path = self.path_for_layer(id);
-        let mut options = fs::OpenOptions::new();
-        options.read(true);
-        options.create(false);
-        let mut result = options.open(path).await?;
-        let metadata = result.metadata().await?;
-        #[cfg(target_os = "windows")]
-        let size = metadata.file_size();
-        #[cfg(not(target_os = "windows"))]
-        let size = metadata.size();
-        let mut buf = Vec::with_capacity(size as usize);
-        result.read_to_end(&mut buf).await?;
-        buf.shrink_to_fit();
-
-        Ok(buf.into())
+        tokio::task::spawn_blocking(move || mmap_file(&path))
+            .await
+            .map_err(io::Error::other)?
     }
 
     async fn get_layer_structure_bytes(
@@ -183,20 +198,14 @@ impl ArchiveBackend for DirectoryArchiveBackend {
         id: [u32; 5],
         file_type: LayerFileEnum,
     ) -> io::Result<Option<Bytes>> {
+        // Map the whole archive and return a slice of the requested structure;
+        // the returned `Bytes` shares the mmap, so only the header + that
+        // structure's pages ever fault in.
         let path = self.path_for_layer(id);
-        let mut options = tokio::fs::OpenOptions::new();
-        options.read(true);
-        let mut file = options.open(path).await?;
-        let header = ArchiveHeader::parse_from_reader(&mut file).await?;
-        if let Some(range) = header.range_for(file_type) {
-            let mut data = vec![0; range.len()];
-            file.seek(SeekFrom::Current((range.start) as i64)).await?;
-            file.read_exact(&mut data).await?;
-
-            Ok(Some(Bytes::from(data)))
-        } else {
-            Ok(None)
-        }
+        let bytes = tokio::task::spawn_blocking(move || mmap_file(&path))
+            .await
+            .map_err(io::Error::other)??;
+        Ok(Archive::parse(bytes).slice_for(file_type))
     }
 
     async fn store_layer_file(&self, id: [u32; 5], mut bytes: Bytes) -> io::Result<()> {

@@ -899,6 +899,21 @@ impl Store {
         Ok(layer.map(|layer| StoreLayer::wrap(layer, self.clone())))
     }
 
+    /// Spawn a background task that keeps read depth bounded: every `interval`
+    /// it rolls up (non-destructively) any label head whose effective layer
+    /// stack exceeds `max_depth`. Returns the task handle; abort it to stop.
+    ///
+    /// Rollup-only, never squash — every original layer is retained and the
+    /// content-addressed parent chain stays walkable, so immutability and the
+    /// per-commit audit trail are preserved.
+    pub fn spawn_compaction(
+        &self,
+        max_depth: usize,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        compaction::CompactionManager::new(self.clone(), max_depth).spawn(interval)
+    }
+
     /// Create a base layer builder, unattached to any database label.
     ///
     /// After having committed it, use `set_head` on a `NamedGraph` to attach it.
@@ -1153,6 +1168,81 @@ mod tests {
         let store = open_directory_store(dir.path());
 
         create_and_manipulate_database(store).await;
+    }
+
+    #[tokio::test]
+    async fn create_and_manipulate_archive_database() {
+        // Exercises the archive (.larch) path with the mmap-backed
+        // DirectoryArchiveBackend + LRU.
+        let dir = tempdir().unwrap();
+        let store = open_archive_store(dir.path(), 100);
+
+        create_and_manipulate_database(store).await;
+    }
+
+    #[tokio::test]
+    async fn archive_database_reopens_from_disk() {
+        // A fresh store over the same directory reads layers back via mmap.
+        let dir = tempdir().unwrap();
+        let name = {
+            let store = open_archive_store(dir.path(), 100);
+            let db = store.create("g").await.unwrap();
+            let builder = store.create_base_layer().await.unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_string_value("cow", "says", "moo"))
+                .unwrap();
+            let layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+            layer.name()
+        };
+        let store = open_archive_store(dir.path(), 100);
+        let layer = store.get_layer_from_id(name).await.unwrap().unwrap();
+        assert!(layer.value_triple_exists(&ValueTriple::new_string_value("cow", "says", "moo")));
+    }
+
+    #[tokio::test]
+    async fn spawn_compaction_bounds_depth_in_background() {
+        let store = open_memory_store();
+        let db = store.create("g").await.unwrap();
+
+        let builder = store.create_base_layer().await.unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("a", "p", "1"))
+            .unwrap();
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        for i in 1..5 {
+            let builder = layer.open_write().await.unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_string_value(&format!("k{}", i), "p", "v"))
+                .unwrap();
+            layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+        }
+        let head_name = layer.name();
+
+        let handle = store.spawn_compaction(2, std::time::Duration::from_millis(20));
+
+        // wait (bounded) for a background tick to roll the deep head up
+        let mut rolled = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let internal = store
+                .layer_store
+                .get_layer(head_name)
+                .await
+                .unwrap()
+                .unwrap();
+            if internal.is_rollup() {
+                rolled = true;
+                break;
+            }
+        }
+        handle.abort();
+        assert!(
+            rolled,
+            "background compaction should have rolled up the deep head"
+        );
     }
 
     #[tokio::test]
