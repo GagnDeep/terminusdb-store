@@ -80,6 +80,25 @@ pub trait ArchiveMetadataBackend: Clone + Send + Sync {
     async fn get_rollup(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>>;
     async fn set_rollup(&self, id: [u32; 5], rollup: [u32; 5]) -> io::Result<()>;
     async fn get_parent(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>>;
+
+    /// Read the persisted stack manifest for a layer (the encoded ordered
+    /// ancestor id list). Default `None` = no manifest support / not present.
+    async fn get_stack_manifest(&self, _id: [u32; 5]) -> io::Result<Option<Bytes>> {
+        Ok(None)
+    }
+
+    /// Write the persisted stack manifest for a layer. Default no-op.
+    async fn set_stack_manifest(&self, _id: [u32; 5], _bytes: Bytes) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Hook invoked after a layer is finalized so a backend that supports
+    /// manifests can build this layer's manifest from its parent's (O(1) once
+    /// the parent has one). Default no-op — backends without manifest support
+    /// pay nothing.
+    async fn on_layer_finalized(&self, _id: [u32; 5]) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct BytesAsyncReader(Bytes);
@@ -742,6 +761,16 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
         } else {
             Ok(None)
         }
+    }
+
+    async fn get_stack_manifest(&self, id: [u32; 5]) -> io::Result<Option<Bytes>> {
+        self.metadata_origin.get_stack_manifest(id).await
+    }
+    async fn set_stack_manifest(&self, id: [u32; 5], bytes: Bytes) -> io::Result<()> {
+        self.metadata_origin.set_stack_manifest(id, bytes).await
+    }
+    async fn on_layer_finalized(&self, id: [u32; 5]) -> io::Result<()> {
+        self.metadata_origin.on_layer_finalized(id).await
     }
 }
 
@@ -1601,7 +1630,16 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
 
         self.data_backend
             .store_layer_file(directory, data_buf.freeze())
-            .await
+            .await?;
+
+        // Best-effort stack-manifest maintenance; no-op for backends (directory,
+        // memory) that don't support manifests. Errors are swallowed on purpose:
+        // the manifest is only a read hint, so failing to build it (e.g. an
+        // ancestor archive not yet persisted) must never fail the layer write —
+        // reads fall back to the authoritative parent walk.
+        let _ = self.metadata_backend.on_layer_finalized(directory).await;
+
+        Ok(())
     }
 
     async fn layer_parent(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
@@ -1612,6 +1650,22 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
         // Delegate to the data backend, which owns the cache that the
         // subsequent `base_layer_files`/`child_layer_files` reads will hit.
         self.data_backend.prefetch_layers(names).await
+    }
+
+    async fn warm_layer_stack(&self, name: [u32; 5]) -> io::Result<()> {
+        // If a manifest is present, learn the whole ancestor chain in one GET
+        // and warm every archive in parallel, so the sequential discovery/build
+        // walk that follows hits a warm cache instead of doing one round trip
+        // per ancestor. Hint-only: on absence/parse/validation failure we do
+        // nothing and the authoritative walk proceeds unchanged.
+        if let Some(bytes) = self.metadata_backend.get_stack_manifest(name).await? {
+            if let Some(manifest) = crate::storage::stack_manifest::StackManifest::decode(bytes) {
+                if manifest.is_for(name) {
+                    self.data_backend.prefetch_layers(&manifest.layers).await?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
