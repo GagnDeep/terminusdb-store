@@ -71,17 +71,27 @@ Two new pieces:
   path from regressing and quantifies the starting point.
 - No change to the query path; zero regression risk.
 
-### Stage 1 — selective structure loading (skip unused structures)
-- Make `InternalLayer` structures lazily loadable (`OnceCell` + retained `FileLoad`
-  handles + resident dict counts) and add `async fn prepare(&self, StructureSet)`.
-- Public query entry points declare their structure set and call `prepare` first;
-  sync accessors then `expect("prepared")`.
-- **Payoff:** a disk-less existence/subject/id↔string query fetches ~3 structures
-  per layer instead of ~48, and holds only those in RAM. No tdb-succinct fork.
-- **Cost/risk:** touches `base.rs`, `child.rs`, `mod.rs` (field types + ~40
-  accessors), and every iterator; property-test each query type against the eager
-  layer for identical results. Behind a feature flag; eager path stays the default.
-- **Checkpoint** before starting: this is the large, invasive stage.
+### Stage 1 — selective, chain-walking query methods (LANDED for existence + s/p/sp)
+Rather than the invasive `InternalLayer`-laziness rework, Stage 1 landed as
+**new `Store` methods that walk the chain using the existing per-layer selective
+primitives** — no rewrite of the ~40 accessors, and the eager `get_layer` path is
+untouched. Each is differential-tested against the fully-materialized layer.
+- **1a — `selective_id_triple_exists`** (done): adjacency-only existence walk;
+  transfers ~31% of a full read.
+- **1b — `selective_value_triple_exists`** (done): resolves strings→ids via
+  per-layer dictionaries + id-maps (replicating `InternalLayer`'s resolution
+  exactly, incl. the `+node_dict_len` value shift and cumulative offsets),
+  differential-tested over nodes, predicates, and typed values; ~78% of a full
+  read. Also added a **per-layer archive-header cache** (headers are immutable),
+  which cut a full `get_layer`'s transfer 268 KB → 47 KB by sharing one header
+  probe across a layer's many structure reads.
+- **1c — `selective_id_triples_s/_sp/_p`** (done): disk-less traversal by subject
+  and predicate, reconciled head-first; differential-tested.
+- **Deferred:** `selective_id_triples_o` (the o_ps object index is renumbered
+  per layer, so a global object id needs mapping to each layer's local index),
+  and the deeper `InternalLayer`-laziness rework (only needed if arbitrary
+  whole-layer materialization must also shrink; the selective methods above cover
+  the common disk-less query classes).
 
 ### Stage 2 — block-lazy dictionary (biggest RAM component)
 - Extend `SizedDict` (fork/vendor tdb-succinct, or a terminus-side wrapper over its
