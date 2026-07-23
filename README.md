@@ -119,6 +119,14 @@ passed through `object_store`'s builders (`AmazonS3Builder`, `GoogleCloudStorage
 `MicrosoftAzureBuilder`) or its env vars (`AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ALLOW_HTTP`).
 
+**Performance & scale.** The backend is tuned for low S3 latency and RAM:
+layers are read with a parallel-prefetch stack manifest (deep-chain cold reads
+drop ~13× vs. a sequential walk), archives are memory-mapped for larger-than-RAM
+reads over a local-NVMe/RAM buffer pool, `Store::spawn_compaction` bounds read
+depth via non-destructive rollup, and `store::buffered::BufferedNamedGraph` adds
+opt-in group commit (many commits → one object) with an optional per-commit
+write-ahead log. See [`docs/object-store-optimizations.md`](docs/object-store-optimizations.md).
+
 **Integration tests.** `docker-compose.minio.yml` brings up MinIO for the
 `#[ignore]`d integration tests; see the design notes in
 [`docs/RFC-object-store.md`](docs/RFC-object-store.md).
