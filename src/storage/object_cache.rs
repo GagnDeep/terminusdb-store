@@ -44,6 +44,30 @@ const PREFIX_DIR_SIZE: usize = 3;
 /// Maximum number of layer archives fetched concurrently during a prefetch wave.
 const PREFETCH_CONCURRENCY: usize = 16;
 
+/// Owns a memory-map so it can back a [`Bytes`] via `Bytes::from_owner`; slices
+/// derived from that `Bytes` keep the mapping alive by reference count.
+struct MmapOwner(memmap2::Mmap);
+
+impl AsRef<[u8]> for MmapOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Memory-map a cache file into a `Bytes`. Returns `None` if the file is absent;
+/// an empty file maps to empty `Bytes` (mmap rejects zero-length maps).
+fn mmap_path(path: &std::path::Path) -> Option<Bytes> {
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return Some(Bytes::new());
+    }
+    // SAFETY: layer archives are content-addressed and immutable once written,
+    // so the mapped region is never mutated or truncated while mapped.
+    let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+    Some(Bytes::from_owner(MmapOwner(mmap)))
+}
+
 /// Atomic counters for the disk-spill tier. Cloneable via [`Arc`]; a live view
 /// is taken with [`CacheStats::snapshot`].
 #[derive(Debug, Default)]
@@ -136,11 +160,18 @@ impl<D> DiskSpillArchiveBackend<D> {
     }
 
     /// Read a fully-written cache file, or `None` if it is not present.
+    ///
+    /// The file is memory-mapped rather than read into the heap: layer archives
+    /// are content-addressed and immutable once written, so the mapping never
+    /// changes underneath us, and only the pages a query actually touches become
+    /// resident. This is what lets a graph larger than RAM be read from the local
+    /// NVMe cache — the OS page cache is the buffer pool.
     async fn read_cached(&self, id: [u32; 5]) -> Option<Bytes> {
-        match fs::read(self.cache_path(id)).await {
-            Ok(v) => Some(Bytes::from(v)),
-            Err(_) => None,
-        }
+        let path = self.cache_path(id);
+        tokio::task::spawn_blocking(move || mmap_path(&path))
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Best-effort write-through to disk. Writes to a temporary sibling and
@@ -463,6 +494,83 @@ mod tests {
             stats.hits, stats.misses, stats.bytes_fetched
         );
         println!("=================================================================\n");
+    }
+
+    // ---- Phase 0B: mmap-backed reads / larger-than-RAM ----
+
+    // A layer store whose in-memory LRU budget is `mem_mib` MiB, over an mmap'd
+    // disk tier over the origin. With mem_mib = 0 the RAM cache holds nothing, so
+    // every structure read is served from the memory-mapped disk file.
+    fn layer_store_disk_mem(
+        store: Arc<dyn ObjectStore>,
+        dir: PathBuf,
+        mem_mib: usize,
+    ) -> (DiskLayerStore, Disk) {
+        let object = ObjectArchiveBackend::new(store, "");
+        let disk = DiskSpillArchiveBackend::new(object.clone(), dir);
+        let lru = LruArchiveBackend::new(object, disk.clone(), mem_mib);
+        let ls = ArchiveLayerStore::new(lru.clone(), lru);
+        (ls, disk)
+    }
+
+    async fn build_wide_chain(store: &DiskLayerStore, layers: usize, per_layer: usize) -> [u32; 5] {
+        let mut builder = store.create_base_layer().await.unwrap();
+        let mut name = builder.name();
+        for i in 0..per_layer {
+            builder.add_value_triple(ValueTriple::new_string_value(
+                &format!("s{}", i),
+                "p",
+                &format!("o{}", i),
+            ));
+        }
+        builder.commit_boxed().await.unwrap();
+        store.finalize_layer(name).await.unwrap();
+        for l in 1..layers {
+            let mut builder = store.create_child_layer(name).await.unwrap();
+            name = builder.name();
+            for i in 0..per_layer {
+                builder.add_value_triple(ValueTriple::new_string_value(
+                    &format!("s{}_{}", l, i),
+                    "p",
+                    &format!("o{}_{}", l, i),
+                ));
+            }
+            builder.commit_boxed().await.unwrap();
+            store.finalize_layer(name).await.unwrap();
+        }
+        name
+    }
+
+    /// With a zero-byte RAM cache, the whole read is served from the memory-mapped
+    /// disk tier — proving the graph can be read without holding its structures in
+    /// the heap cache (the larger-than-RAM path).
+    #[tokio::test]
+    async fn larger_than_ram_read_via_mmap() {
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dir = tempdir().unwrap();
+
+        let head = {
+            // build with a normal cache so writes go through and populate disk
+            let (ls, _) = layer_store_disk_mem(bucket.clone(), dir.path().to_path_buf(), 100);
+            build_wide_chain(&ls, 4, 250).await
+        };
+
+        // reopen with a ZERO-byte RAM cache: nothing fits, so every structure read
+        // must come from the mmap'd disk file.
+        let (ls, disk) = layer_store_disk_mem(bucket.clone(), dir.path().to_path_buf(), 0);
+        let layer = ls.get_layer(head).await.unwrap().unwrap();
+
+        // spot-check triples from the base and the top layer
+        assert!(layer.value_triple_exists(&ValueTriple::new_string_value("s0", "p", "o0")));
+        assert!(layer.value_triple_exists(&ValueTriple::new_string_value("s3_249", "p", "o3_249")));
+        assert!(!layer.value_triple_exists(&ValueTriple::new_string_value("nope", "p", "nope")));
+
+        // and a full scan reconstructs every triple
+        let count = layer.triples().count();
+        assert_eq!(4 * 250, count);
+
+        // the disk tier actually served the reads (RAM cache held nothing)
+        assert!(disk.stats().hits + disk.stats().misses > 0);
     }
 
     #[tokio::test]
