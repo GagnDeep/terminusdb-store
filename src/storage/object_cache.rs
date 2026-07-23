@@ -44,30 +44,6 @@ const PREFIX_DIR_SIZE: usize = 3;
 /// Maximum number of layer archives fetched concurrently during a prefetch wave.
 const PREFETCH_CONCURRENCY: usize = 16;
 
-/// Owns a memory-map so it can back a [`Bytes`] via `Bytes::from_owner`; slices
-/// derived from that `Bytes` keep the mapping alive by reference count.
-struct MmapOwner(memmap2::Mmap);
-
-impl AsRef<[u8]> for MmapOwner {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-/// Memory-map a cache file into a `Bytes`. Returns `None` if the file is absent;
-/// an empty file maps to empty `Bytes` (mmap rejects zero-length maps).
-fn mmap_path(path: &std::path::Path) -> Option<Bytes> {
-    let file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    if len == 0 {
-        return Some(Bytes::new());
-    }
-    // SAFETY: layer archives are content-addressed and immutable once written,
-    // so the mapped region is never mutated or truncated while mapped.
-    let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
-    Some(Bytes::from_owner(MmapOwner(mmap)))
-}
-
 /// Atomic counters for the disk-spill tier. Cloneable via [`Arc`]; a live view
 /// is taken with [`CacheStats::snapshot`].
 #[derive(Debug, Default)]
@@ -168,7 +144,7 @@ impl<D> DiskSpillArchiveBackend<D> {
     /// NVMe cache — the OS page cache is the buffer pool.
     async fn read_cached(&self, id: [u32; 5]) -> Option<Bytes> {
         let path = self.cache_path(id);
-        tokio::task::spawn_blocking(move || mmap_path(&path))
+        tokio::task::spawn_blocking(move || super::archive::mmap_file(&path).ok())
             .await
             .ok()
             .flatten()
