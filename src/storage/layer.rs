@@ -370,6 +370,17 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
         Ok(())
     }
 
+    /// Prefetch the given layer archives concurrently into whatever cache the
+    /// store has, so a subsequent sequential build reads from a warm cache
+    /// instead of issuing one blocking round trip per layer.
+    ///
+    /// Best-effort: implementations should swallow per-layer errors (the
+    /// authoritative load happens afterwards regardless). The default is a
+    /// no-op, so stores without a cache (directory, memory) are unaffected.
+    async fn prefetch_layers(&self, _names: &[[u32; 5]]) -> io::Result<()> {
+        Ok(())
+    }
+
     async fn layer_has_rollup(&self, name: [u32; 5]) -> io::Result<bool> {
         self.file_exists(name, FILENAMES.rollup).await
     }
@@ -1512,6 +1523,23 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                     }
                 }
             }
+        }
+
+        // Prefetch every archive we are about to load in one bounded-concurrency
+        // wave, so the sequential build loop below reads from a warm cache rather
+        // than issuing one blocking round trip per ancestor. Only the uncached
+        // suffix is in `layers_to_load` (the discovery loop stopped at the first
+        // cached ancestor), so this preserves cache short-circuiting. Best-effort:
+        // a prefetch failure is ignored and the build loop fetches authoritatively.
+        {
+            let prefetch_ids: Vec<[u32; 5]> = layers_to_load
+                .iter()
+                .map(|(original, rollup)| match rollup {
+                    Some((rollup_id, _)) => *rollup_id,
+                    None => *original,
+                })
+                .collect();
+            let _ = self.prefetch_layers(&prefetch_ids).await;
         }
 
         if ancestor.is_none() {

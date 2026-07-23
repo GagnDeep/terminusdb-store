@@ -41,6 +41,9 @@ use super::layer::name_to_string;
 
 const PREFIX_DIR_SIZE: usize = 3;
 
+/// Maximum number of layer archives fetched concurrently during a prefetch wave.
+const PREFETCH_CONCURRENCY: usize = 16;
+
 /// Atomic counters for the disk-spill tier. Cloneable via [`Arc`]; a live view
 /// is taken with [`CacheStats::snapshot`].
 #[derive(Debug, Default)]
@@ -218,6 +221,19 @@ impl<D: ArchiveBackend> ArchiveBackend for DiskSpillArchiveBackend<D> {
         self.inner
             .read_layer_structure_bytes_from(id, file_type, read_from)
             .await
+    }
+
+    async fn prefetch_layers(&self, ids: &[[u32; 5]]) -> io::Result<()> {
+        use futures::stream::StreamExt;
+        // Warm the disk tier (and its origin) concurrently. `get_layer_bytes`
+        // records hit/miss stats and populates the local cache file, so a later
+        // read is a local hit. Best-effort: per-layer errors are swallowed.
+        futures::stream::iter(ids.iter().copied())
+            .for_each_concurrent(PREFETCH_CONCURRENCY, |id| async move {
+                let _ = self.get_layer_bytes(id).await;
+            })
+            .await;
+        Ok(())
     }
 }
 
