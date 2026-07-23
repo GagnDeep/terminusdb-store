@@ -841,6 +841,28 @@ impl NamedGraph {
     }
 }
 
+/// Reconcile per-layer `(additions, removals)` given head-first into the set of
+/// id-triples that exist: the newest layer that mentions a triple decides it
+/// (an addition includes it, a removal excludes it). Result is sorted.
+fn reconcile_layered(per_layer_head_first: Vec<(Vec<IdTriple>, Vec<IdTriple>)>) -> Vec<IdTriple> {
+    use std::collections::HashSet;
+    let mut result: HashSet<IdTriple> = HashSet::new();
+    let mut seen: HashSet<IdTriple> = HashSet::new();
+    for (adds, removes) in per_layer_head_first {
+        for t in adds {
+            if seen.insert(t) {
+                result.insert(t);
+            }
+        }
+        for t in removes {
+            seen.insert(t);
+        }
+    }
+    let mut v: Vec<IdTriple> = result.into_iter().collect();
+    v.sort();
+    v
+}
+
 impl Store {
     /// Create a new store from the given label and layer store.
     pub fn new<Labels: 'static + LabelStore, Layers: 'static + LayerStore>(
@@ -1055,6 +1077,74 @@ impl Store {
         self.selective_id_triple_exists(head, IdTriple::new(subject, predicate, object))
             .await
     }
+
+    /// All id-triples with subject `subject` in the graph headed by `head`,
+    /// loading only the adjacency structures of each layer (the disk-less
+    /// traversal path). See [`selective_id_triple_exists`](Self::selective_id_triple_exists)
+    /// for the correctness rationale. (Phase 3, Stage 1c.)
+    pub async fn selective_id_triples_s(
+        &self,
+        head: [u32; 5],
+        subject: u64,
+    ) -> io::Result<Vec<IdTriple>> {
+        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let mut per_layer = Vec::with_capacity(chain.len());
+        for &layer in chain.iter().rev() {
+            let adds = self.layer_store.triple_additions_s(layer, subject).await?;
+            let removes = self.layer_store.triple_removals_s(layer, subject).await?;
+            per_layer.push((adds.collect(), removes.collect()));
+        }
+        Ok(reconcile_layered(per_layer))
+    }
+
+    /// All id-triples with subject `subject` and predicate `predicate`.
+    pub async fn selective_id_triples_sp(
+        &self,
+        head: [u32; 5],
+        subject: u64,
+        predicate: u64,
+    ) -> io::Result<Vec<IdTriple>> {
+        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let mut per_layer = Vec::with_capacity(chain.len());
+        for &layer in chain.iter().rev() {
+            let adds = self
+                .layer_store
+                .triple_additions_sp(layer, subject, predicate)
+                .await?;
+            let removes = self
+                .layer_store
+                .triple_removals_sp(layer, subject, predicate)
+                .await?;
+            per_layer.push((adds.collect(), removes.collect()));
+        }
+        Ok(reconcile_layered(per_layer))
+    }
+
+    /// All id-triples with predicate `predicate`.
+    pub async fn selective_id_triples_p(
+        &self,
+        head: [u32; 5],
+        predicate: u64,
+    ) -> io::Result<Vec<IdTriple>> {
+        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let mut per_layer = Vec::with_capacity(chain.len());
+        for &layer in chain.iter().rev() {
+            let adds = self
+                .layer_store
+                .triple_additions_p(layer, predicate)
+                .await?;
+            let removes = self.layer_store.triple_removals_p(layer, predicate).await?;
+            per_layer.push((adds.collect(), removes.collect()));
+        }
+        Ok(reconcile_layered(per_layer))
+    }
+
+    // NB: an object-direction `selective_id_triples_o` is deliberately omitted
+    // for now. Unlike subjects and predicates, whose ids are stable across the
+    // chain, the object index (o_ps) is renumbered per layer, so a head-level
+    // global object id must be mapped to each layer's local object index before
+    // querying. That per-layer mapping is a follow-up; the subject/predicate
+    // directions above cover the common traversal patterns.
 
     /// Spawn a background task that keeps read depth bounded: every `interval`
     /// it rolls up (non-destructively) any label head whose effective layer
@@ -1409,7 +1499,7 @@ mod tests {
 
     #[tokio::test]
     async fn selective_value_triple_exists_matches_full_layer() {
-        use tdb_succinct::{TdbDataType, TypedDictEntry};
+        use tdb_succinct::TdbDataType;
 
         let store = open_memory_store();
         let db = store.create("g").await.unwrap();
@@ -1496,9 +1586,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selective_id_triples_iterators_match_full_layer() {
+        use std::collections::HashSet;
+
+        let store = open_memory_store();
+        let db = store.create("g").await.unwrap();
+        let vn = |s: &str, p: &str, o: &str| ValueTriple::new_node(s, p, o);
+
+        // base
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..30 {
+            for p in 0..3 {
+                builder
+                    .add_value_triple(vn(
+                        &format!("s{}", i),
+                        &format!("p{}", p),
+                        &format!("s{}", (i + p + 1) % 30),
+                    ))
+                    .unwrap();
+            }
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        // child: add + remove
+        let builder = layer.open_write().await.unwrap();
+        for i in 30..40 {
+            builder
+                .add_value_triple(vn(&format!("s{}", i), "p0", "s0"))
+                .unwrap();
+        }
+        for i in 0..10 {
+            builder
+                .remove_value_triple(vn(&format!("s{}", i), "p1", &format!("s{}", (i + 2) % 30)))
+                .unwrap();
+        }
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        // child2: re-add one removed
+        let builder = layer.open_write().await.unwrap();
+        builder.add_value_triple(vn("s0", "p1", "s2")).unwrap();
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+        let all: Vec<IdTriple> = full.triples().collect();
+        let subjects: HashSet<u64> = all.iter().map(|t| t.subject).collect();
+        let predicates: HashSet<u64> = all.iter().map(|t| t.predicate).collect();
+
+        let sorted = |it: Box<dyn Iterator<Item = IdTriple> + Send>| {
+            let mut v: Vec<IdTriple> = it.collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+
+        for &s in &subjects {
+            assert_eq!(
+                sorted(full.triples_s(s)),
+                store.selective_id_triples_s(head, s).await.unwrap(),
+                "triples_s({})",
+                s
+            );
+        }
+        for &p in &predicates {
+            assert_eq!(
+                sorted(full.triples_p(p)),
+                store.selective_id_triples_p(head, p).await.unwrap(),
+                "triples_p({})",
+                p
+            );
+        }
+        for t in all.iter().take(25) {
+            assert_eq!(
+                sorted(full.triples_sp(t.subject, t.predicate)),
+                store
+                    .selective_id_triples_sp(head, t.subject, t.predicate)
+                    .await
+                    .unwrap(),
+                "triples_sp({},{})",
+                t.subject,
+                t.predicate
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn selective_value_triple_exists_matches_full_layer_randomized() {
         use rand::{rngs::StdRng, Rng, SeedableRng};
-        use tdb_succinct::{TdbDataType, TypedDictEntry};
+        use tdb_succinct::TdbDataType;
 
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
         let store = open_memory_store();
