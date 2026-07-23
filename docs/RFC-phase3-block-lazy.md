@@ -85,13 +85,16 @@ untouched. Each is differential-tested against the fully-materialized layer.
   read. Also added a **per-layer archive-header cache** (headers are immutable),
   which cut a full `get_layer`'s transfer 268 KB → 47 KB by sharing one header
   probe across a layer's many structure reads.
-- **1c — `selective_id_triples_s/_sp/_p`** (done): disk-less traversal by subject
-  and predicate, reconciled head-first; differential-tested.
-- **Deferred:** `selective_id_triples_o` (the o_ps object index is renumbered
-  per layer, so a global object id needs mapping to each layer's local index),
-  and the deeper `InternalLayer`-laziness rework (only needed if arbitrary
-  whole-layer materialization must also shrink; the selective methods above cover
-  the common disk-less query classes).
+- **1c — `selective_id_triples_s/_sp/_p/_o`** (done): disk-less traversal by
+  subject, predicate, and object, reconciled head-first; differential-tested
+  across all four directions. (`_o` needs an exact-object filter because the
+  cached per-layer iterator seeks to the nearest object rather than filtering.)
+- **Deferred:** the deeper `InternalLayer`-laziness rework (only needed if
+  arbitrary whole-layer materialization must also shrink; the selective methods
+  above cover the common disk-less query classes — existence and traversal).
+
+**Stage 1 is complete.** Disk-less existence and traversal queries no longer
+materialize whole layers.
 
 ### Stage 2 — block-lazy dictionary (biggest RAM component)
 - Extend `SizedDict` (fork/vendor tdb-succinct, or a terminus-side wrapper over its
