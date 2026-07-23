@@ -641,25 +641,44 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
         self.metadata_origin.get_layer_names().await
     }
     async fn layer_exists(&self, id: [u32; 5]) -> io::Result<bool> {
-        if let Some(CacheEntry::Resolved(_)) = self.cache.lock().await.peek(&id) {
+        // NB: extract the cached answer in a block so the cache lock is dropped
+        // *before* the fallback origin await — otherwise the guard temporary is
+        // held across `.await`, serializing all concurrent metadata lookups on
+        // the cache mutex (which throttles parallel prefetch).
+        let cached = matches!(
+            self.cache.lock().await.peek(&id),
+            Some(CacheEntry::Resolved(_))
+        );
+        if cached {
             Ok(true)
         } else {
             self.metadata_origin.layer_exists(id).await
         }
     }
     async fn layer_size(&self, id: [u32; 5]) -> io::Result<u64> {
-        if let Some(CacheEntry::Resolved(bytes)) = self.cache.lock().await.peek(&id) {
-            Ok(bytes.len() as u64)
-        } else {
-            self.metadata_origin.layer_size(id).await
+        let cached = {
+            match self.cache.lock().await.peek(&id) {
+                Some(CacheEntry::Resolved(bytes)) => Some(bytes.len() as u64),
+                _ => None,
+            }
+        };
+        match cached {
+            Some(len) => Ok(len),
+            None => self.metadata_origin.layer_size(id).await,
         }
     }
     async fn layer_file_exists(&self, id: [u32; 5], file_type: LayerFileEnum) -> io::Result<bool> {
-        if let Some(CacheEntry::Resolved(bytes)) = self.cache.lock().await.peek(&id) {
-            let header = ArchiveFilePresenceHeader::new(bytes.clone().get_u64());
-            Ok(header.is_present(file_type))
-        } else {
-            self.metadata_origin.layer_file_exists(id, file_type).await
+        let cached = {
+            match self.cache.lock().await.peek(&id) {
+                Some(CacheEntry::Resolved(bytes)) => Some(
+                    ArchiveFilePresenceHeader::new(bytes.clone().get_u64()).is_present(file_type),
+                ),
+                _ => None,
+            }
+        };
+        match cached {
+            Some(present) => Ok(present),
+            None => self.metadata_origin.layer_file_exists(id, file_type).await,
         }
     }
     async fn get_layer_structure_size(
@@ -667,24 +686,28 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
         id: [u32; 5],
         file_type: LayerFileEnum,
     ) -> io::Result<usize> {
-        if let Some(CacheEntry::Resolved(bytes)) = self.cache.lock().await.peek(&id) {
-            let (header, _) = ArchiveHeader::parse(bytes.clone());
-
-            if let Some(size) = header.size_of(file_type) {
-                Ok(size)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "structure {file_type:?} not found in layer {}",
-                        name_to_string(id)
-                    ),
-                ))
+        let cached = {
+            match self.cache.lock().await.peek(&id) {
+                Some(CacheEntry::Resolved(bytes)) => {
+                    Some(ArchiveHeader::parse(bytes.clone()).0.size_of(file_type))
+                }
+                _ => None,
             }
-        } else {
-            self.metadata_origin
-                .get_layer_structure_size(id, file_type)
-                .await
+        };
+        match cached {
+            Some(Some(size)) => Ok(size),
+            Some(None) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "structure {file_type:?} not found in layer {}",
+                    name_to_string(id)
+                ),
+            )),
+            None => {
+                self.metadata_origin
+                    .get_layer_structure_size(id, file_type)
+                    .await
+            }
         }
     }
     async fn get_rollup(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
