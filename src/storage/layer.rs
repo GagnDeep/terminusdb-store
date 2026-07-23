@@ -381,6 +381,12 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
         Ok(())
     }
 
+    /// Warm the entire ancestor chain of `name` into cache ahead of a read,
+    /// using a persisted stack manifest if the store has one. Default no-op.
+    async fn warm_layer_stack(&self, _name: [u32; 5]) -> io::Result<()> {
+        Ok(())
+    }
+
     async fn layer_has_rollup(&self, name: [u32; 5]) -> io::Result<bool> {
         self.file_exists(name, FILENAMES.rollup).await
     }
@@ -1456,6 +1462,11 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         if !self.directory_exists(name).await? {
             return Ok(None);
         }
+
+        // If the store has a stack manifest, warm the whole ancestor chain's
+        // archives in parallel now, so the sequential discovery/build walk below
+        // reads from a warm cache. No-op for stores without manifest support.
+        let _ = self.warm_layer_stack(name).await;
 
         // find an ancestor in cache
         let mut ancestor = None;

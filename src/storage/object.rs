@@ -48,6 +48,7 @@ use super::archive::{Archive, ArchiveBackend, ArchiveHeader, ArchiveMetadataBack
 use super::consts::LayerFileEnum;
 use super::label::{Label, LabelStore};
 use super::layer::{name_to_string, string_to_name};
+use super::stack_manifest::StackManifest;
 
 /// Errors surfaced by the object-store backend that are not naturally an
 /// [`io::Error`] on their own. They are wrapped in an [`io::Error`] (and are
@@ -143,6 +144,24 @@ impl ObjectArchiveBackend {
     fn rollup_key(&self, id: [u32; 5]) -> ObjectPath {
         let s = name_to_string(id);
         self.key(&format!("{}/{}.rollup.hex", &s[0..3], s))
+    }
+
+    fn stack_key(&self, id: [u32; 5]) -> ObjectPath {
+        let s = name_to_string(id);
+        self.key(&format!("{}/{}.stack", &s[0..3], s))
+    }
+
+    /// Walk parent pointers from `id` (inclusive) to the base, returning the
+    /// ordered chain head-first. Used only to seed a manifest when an ancestor
+    /// has none; once ancestors have manifests this is never called.
+    async fn walk_parents_inclusive(&self, id: [u32; 5]) -> io::Result<Vec<[u32; 5]>> {
+        let mut chain = vec![id];
+        let mut current = id;
+        while let Some(parent) = self.get_parent(current).await? {
+            chain.push(parent);
+            current = parent;
+        }
+        Ok(chain)
     }
 
     fn list_prefix(&self) -> Option<ObjectPath> {
@@ -340,6 +359,47 @@ impl ArchiveMetadataBackend for ObjectArchiveBackend {
         } else {
             Ok(None)
         }
+    }
+
+    async fn get_stack_manifest(&self, id: [u32; 5]) -> io::Result<Option<Bytes>> {
+        let path = self.stack_key(id);
+        match self.store.get(&path).await {
+            Ok(r) => Ok(Some(r.bytes().await.map_err(os_err_to_io)?)),
+            Err(OsError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(os_err_to_io(e)),
+        }
+    }
+
+    async fn set_stack_manifest(&self, id: [u32; 5], bytes: Bytes) -> io::Result<()> {
+        // Overwrite is safe: the manifest is keyed by an immutable,
+        // content-addressed head, so it is written once for a unique layer.
+        self.store
+            .put(&self.stack_key(id), bytes.into())
+            .await
+            .map_err(os_err_to_io)?;
+        Ok(())
+    }
+
+    async fn on_layer_finalized(&self, id: [u32; 5]) -> io::Result<()> {
+        // Build this layer's manifest = [id] ++ parent's chain. If the parent
+        // already has a manifest (the common case for freshly built chains) this
+        // is O(1); otherwise we seed by walking parents once.
+        let chain = match self.get_parent(id).await? {
+            None => vec![id],
+            Some(parent) => {
+                let mut chain = vec![id];
+                match self.get_stack_manifest(parent).await? {
+                    Some(bytes) => match StackManifest::decode(bytes) {
+                        Some(m) if m.is_for(parent) => chain.extend(m.layers),
+                        _ => chain.extend(self.walk_parents_inclusive(parent).await?),
+                    },
+                    None => chain.extend(self.walk_parents_inclusive(parent).await?),
+                }
+                chain
+            }
+        };
+        self.set_stack_manifest(id, StackManifest::new(chain).encode())
+            .await
     }
 }
 

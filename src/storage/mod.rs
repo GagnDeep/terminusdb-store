@@ -39,6 +39,7 @@ pub mod object;
 #[cfg(feature = "object-store")]
 pub mod object_cache;
 pub mod pack;
+pub mod stack_manifest;
 
 pub use cache::*;
 pub use delta::*;
