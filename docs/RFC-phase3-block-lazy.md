@@ -135,8 +135,21 @@ no-fork decision held — `SizedDictBlock::{parse,entry,id,num_entries}` and
   - Differential-tested on both branches (small-dict whole-dict path and a >512-entry
     block-lazy path) against the fully-materialized layer.
 
-  Values (`TypedDict`) still load whole — block-lazy is string-dictionary only; a typed
-  block-lazy reader is the remaining increment if value dictionaries become the ceiling.
+- **2d — block-lazy typed value dictionary** (done): `BlockLazyTypedDict` extends the
+  approach to `TypedDict`. It keeps the three small index logarrays resident
+  (`types_present`, `type_offsets`, `block_offsets`) plus the per-datatype id offsets,
+  then resolves a value via `TypedDict`'s segment model — find the datatype's segment,
+  binary-search its blocks — fetching only the O(log n) blocks a lookup touches. It
+  replicates the exact tdb-succinct details (a segment's block `k` is the global block
+  `seg_start + k`; `TypedDict` strips the 8 trailing data bytes; per-segment id offsets
+  need one control byte per datatype boundary; `id = block id + segment id_offset`).
+  Wired into value-object resolution (block-lazy above the threshold, whole value dict
+  below). Differential-tested against `TypedDict::id_entry` across string/i32/f64 and
+  end-to-end over a >512-entry, three-datatype value dictionary.
+  - **Measured win:** with subject and value both block-lazy, the object-store
+    string-exists byte-transfer test dropped **56% → 35%** of a full read (78% → 35%
+    since Stage 1b). The `id -> value` reverse direction still loads the whole dict; it
+    is not needed by the selective existence path.
 
 ### Stage 3 — block-lazy rank/select (hardest, likely partial)
 - `BitIndex`/`AdjacencyList`/`WaveletTree` do random indexing + data-dependent
