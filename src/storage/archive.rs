@@ -58,6 +58,12 @@ pub trait ArchiveBackend: Clone + Send + Sync {
         file_type: LayerFileEnum,
         read_from: usize,
     ) -> io::Result<Self::Read>;
+
+    /// Best-effort concurrent warm of the given layers into this backend's
+    /// cache (if it has one). Default no-op for cacheless backends.
+    async fn prefetch_layers(&self, _ids: &[[u32; 5]]) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -355,6 +361,9 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
     }
 }
 
+/// Maximum number of layer archives fetched concurrently during a prefetch wave.
+const PREFETCH_CONCURRENCY: usize = 16;
+
 #[derive(Clone)]
 pub struct LruArchiveBackend<M, D> {
     cache: Arc<tokio::sync::Mutex<LruCache<[u32; 5], CacheEntry>>>,
@@ -627,6 +636,22 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
                     .await?,
             ))
         }
+    }
+
+    async fn prefetch_layers(&self, ids: &[[u32; 5]]) -> io::Result<()> {
+        use futures::stream::StreamExt;
+        futures::stream::iter(ids.iter().copied())
+            .for_each_concurrent(PREFETCH_CONCURRENCY, |id| async move {
+                // Only warm layers that fit the RAM budget; `get_layer_bytes`
+                // populates the LRU (and, transitively, any inner data tier such
+                // as the disk-spill cache) and dedupes concurrent fetches via its
+                // Resolving barrier. Errors are swallowed — this is best-effort.
+                if self.layer_fits_in_cache(id).await.unwrap_or(false) {
+                    let _ = self.get_layer_bytes(id).await;
+                }
+            })
+            .await;
+        Ok(())
     }
 }
 
@@ -1581,6 +1606,12 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
 
     async fn layer_parent(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
         self.metadata_backend.get_parent(name).await
+    }
+
+    async fn prefetch_layers(&self, names: &[[u32; 5]]) -> io::Result<()> {
+        // Delegate to the data backend, which owns the cache that the
+        // subsequent `base_layer_files`/`child_layer_files` reads will hit.
+        self.data_backend.prefetch_layers(names).await
     }
 }
 
