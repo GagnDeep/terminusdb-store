@@ -1693,6 +1693,46 @@ impl Store {
         })
     }
 
+    /// A disk-less full scan of the graph headed by `head`: every id-triple, in
+    /// sorted order, reconciled across the layer chain (newest layer wins).
+    ///
+    /// It loads only each layer's **adjacency** (via ranged reads on an object
+    /// backend — no local disk, and none of the dictionaries, object indexes or
+    /// wavelet trees a `get_layer` would materialize), then merge-streams the
+    /// output lazily: the returned iterator yields one triple at a time using the
+    /// exact stack reconciliation of `Layer::triples`, so only the merge frontier
+    /// is added on top of the resident adjacency. The per-layer adjacency loads
+    /// run concurrently.
+    ///
+    /// Mirrors `Layer::triples`. (Phase 3, Stage 5: disk-less scan.)
+    pub async fn selective_id_triples(
+        &self,
+        head: [u32; 5],
+    ) -> io::Result<crate::layer::InternalTripleSubjectIterator> {
+        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let ls = &self.layer_store;
+        // Fetch every layer's addition and removal iterators concurrently,
+        // head-first (index 0 = most recent, as the reconciliation requires).
+        let per_layer =
+            futures::future::try_join_all(chain.iter().rev().map(|&layer| async move {
+                let (adds, rems) =
+                    futures::try_join!(ls.triple_additions(layer), ls.triple_removals(layer))?;
+                Ok::<_, io::Error>((adds, rems))
+            }))
+            .await?;
+        let (mut positives, mut negatives) = (
+            Vec::with_capacity(per_layer.len()),
+            Vec::with_capacity(per_layer.len()),
+        );
+        for (adds, rems) in per_layer {
+            positives.push(adds);
+            negatives.push(rems);
+        }
+        Ok(crate::layer::InternalTripleSubjectIterator::from_iterators(
+            positives, negatives,
+        ))
+    }
+
     /// A disk-less query handle over the graph headed by `head`: the common
     /// read operations without ever materializing a whole layer. See
     /// [`LazyLayer`].
@@ -1940,6 +1980,12 @@ impl LazyLayer {
     }
     pub async fn triples_o(&self, object: u64) -> io::Result<Vec<IdTriple>> {
         self.store.selective_id_triples_o(self.head, object).await
+    }
+    /// Every id-triple in the graph, in sorted order, merge-streamed from the
+    /// per-layer adjacency without materializing whole layers. Mirrors
+    /// `Layer::triples`.
+    pub async fn triples(&self) -> io::Result<impl Iterator<Item = IdTriple> + Send> {
+        self.store.selective_id_triples(self.head).await
     }
 
     // ---- forward resolution (string -> id) ----
@@ -2476,6 +2522,79 @@ mod tests {
             );
         }
         assert_eq!(full.id_subject(sid), lazy.id_subject(sid).await.unwrap());
+    }
+
+    // The disk-less full scan must yield exactly the fully-materialized layer's
+    // triples, including reconciliation of additions against removals.
+    #[tokio::test]
+    async fn selective_id_triples_scan_matches_full_layer_memory() {
+        scan_body(open_memory_store()).await;
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn selective_id_triples_scan_matches_full_layer_object() {
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        scan_body(open_object_store(bucket, "", 1 << 30)).await;
+    }
+
+    async fn scan_body(store: Store) {
+        let db = store.create("g").await.unwrap();
+        let vn = |s: &str, p: &str, o: &str| ValueTriple::new_node(s, p, o);
+
+        // base: a spread of triples
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..80 {
+            builder
+                .add_value_triple(vn(&format!("s{:03}", i), "p", &format!("o{:03}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vn(
+                    &format!("s{:03}", i),
+                    "q",
+                    &format!("o{:03}", (i + 1) % 80),
+                ))
+                .unwrap();
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        // child: remove some, add some (exercises the removal reconciliation)
+        let builder = layer.open_write().await.unwrap();
+        for i in 0..20 {
+            builder
+                .remove_value_triple(vn(&format!("s{:03}", i), "p", &format!("o{:03}", i)))
+                .unwrap();
+        }
+        for i in 80..110 {
+            builder
+                .add_value_triple(vn(&format!("s{:03}", i), "p", &format!("o{:03}", i)))
+                .unwrap();
+        }
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        // grandchild: re-add one previously removed, remove a fresh one
+        let builder = layer.open_write().await.unwrap();
+        builder.add_value_triple(vn("s000", "p", "o000")).unwrap();
+        builder
+            .remove_value_triple(vn("s085", "p", "o085"))
+            .unwrap();
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+        let mut expected: Vec<IdTriple> = full.triples().collect();
+        let mut got: Vec<IdTriple> = store.selective_id_triples(head).await.unwrap().collect();
+        expected.sort();
+        got.sort();
+        assert_eq!(expected, got, "disk-less scan differs from full layer");
+        assert!(!expected.is_empty());
+
+        // LazyLayer::triples yields the same set.
+        let mut via_lazy: Vec<IdTriple> = store.lazy_layer(head).triples().await.unwrap().collect();
+        via_lazy.sort();
+        assert_eq!(expected, via_lazy);
     }
 
     // Reverse (id -> string) resolution must match the fully-materialized layer.
