@@ -117,6 +117,11 @@ impl AsyncRead for BytesReader {
 pub struct ObjectArchiveBackend {
     store: Arc<dyn ObjectStore>,
     prefix: String,
+    /// Parsed archive headers, cached by layer id. Layers are content-addressed
+    /// and immutable, so a header is valid forever — this lets the many
+    /// per-structure reads of one layer share a single header probe instead of
+    /// re-fetching the ~8 KiB header each time.
+    header_cache: Arc<tokio::sync::Mutex<lru::LruCache<[u32; 5], (ArchiveHeader, usize)>>>,
 }
 
 impl ObjectArchiveBackend {
@@ -128,7 +133,13 @@ impl ObjectArchiveBackend {
         while prefix.ends_with('/') {
             prefix.pop();
         }
-        Self { store, prefix }
+        Self {
+            store,
+            prefix,
+            header_cache: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(4096).unwrap(),
+            ))),
+        }
     }
 
     fn key(&self, suffix: &str) -> ObjectPath {
@@ -178,6 +189,9 @@ impl ObjectArchiveBackend {
     /// Fetch and parse the archive header of a layer, returning the header plus
     /// the absolute byte offset at which the data section begins.
     async fn layer_header(&self, id: [u32; 5]) -> io::Result<(ArchiveHeader, usize)> {
+        if let Some(cached) = self.header_cache.lock().await.get(&id) {
+            return Ok(cached.clone());
+        }
         let path = self.layer_key(id);
         let opts = GetOptions {
             range: Some(GetRange::Bounded(0..HEADER_PROBE_BYTES)),
@@ -192,6 +206,11 @@ impl ObjectArchiveBackend {
         let probe_len = probe.len();
         let (header, remainder) = ArchiveHeader::parse(probe.clone());
         let data_start = probe_len - remainder.len();
+        // Immutable layer -> header is valid forever; cache it.
+        self.header_cache
+            .lock()
+            .await
+            .put(id, (header.clone(), data_start));
         Ok((header, data_start))
     }
 }
@@ -996,6 +1015,74 @@ mod tests {
             selective,
             full
         );
+    }
+
+    /// Phase 3, Stage 1b: a selective *string* existence check (resolves via
+    /// dictionaries, then walks adjacency) still transfers less than a full
+    /// `get_layer`, because it never fetches the object index or wavelet tree.
+    #[tokio::test]
+    async fn selective_value_exists_transfers_less_than_full_layer() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let head = {
+            let store = crate::store::open_object_store(bucket.clone(), "", 100);
+            let db = store.create("g").await.unwrap();
+            let builder = store.create_base_layer().await.unwrap();
+            for i in 0..3000 {
+                builder
+                    .add_value_triple(ValueTriple::new_string_value(
+                        &format!("s{}", i),
+                        "p",
+                        &format!("o{}", i),
+                    ))
+                    .unwrap();
+            }
+            let layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+            layer.name()
+        };
+        let target = ValueTriple::new_string_value("s10", "p", "o10");
+
+        let c_sel = Arc::new(AtomicU64::new(0));
+        let s_sel = crate::store::open_object_store(
+            Arc::new(CountingStore {
+                inner: bucket.clone(),
+                ranged_bytes: c_sel.clone(),
+            }),
+            "",
+            0,
+        );
+        assert!(s_sel
+            .selective_value_triple_exists(head, &target)
+            .await
+            .unwrap());
+        let selective = c_sel.load(Ordering::Relaxed);
+
+        let c_full = Arc::new(AtomicU64::new(0));
+        let s_full = crate::store::open_object_store(
+            Arc::new(CountingStore {
+                inner: bucket.clone(),
+                ranged_bytes: c_full.clone(),
+            }),
+            "",
+            0,
+        );
+        assert!(s_full
+            .get_layer_from_id(head)
+            .await
+            .unwrap()
+            .unwrap()
+            .value_triple_exists(&target));
+        let full = c_full.load(Ordering::Relaxed);
+
+        println!(
+            "selective string exists = {} bytes; full get_layer = {} bytes ({:.0}% of full)",
+            selective,
+            full,
+            selective as f64 / full as f64 * 100.0
+        );
+        assert!(selective < full);
     }
 
     // ---- Milestone 2: write path — commit a chain, drop, reopen, read back ----

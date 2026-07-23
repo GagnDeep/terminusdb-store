@@ -938,6 +938,124 @@ impl Store {
         Ok(false)
     }
 
+    /// Like [`selective_id_triple_exists`](Self::selective_id_triple_exists) but
+    /// for a *string* triple: resolves the subject/predicate/object to ids by
+    /// loading only the dictionaries and id-maps of the layers in the chain
+    /// (never the adjacency-only structures are enough for the final existence
+    /// walk). Nothing else is materialized, so on a disk-less replica this
+    /// fetches only dictionaries + id-maps + adjacency — not object indexes or
+    /// wavelet trees. Returns `false` if any string is absent from the graph.
+    ///
+    /// Mirrors `InternalLayer`'s resolution exactly (per-layer dict lookup, the
+    /// layer's id-map `inner_to_outer`, the `+ node_dict_len` shift for values,
+    /// and the cumulative parent count as the global offset), verified against
+    /// the fully-materialized layer by a differential test. (Phase 3, Stage 1b.)
+    pub async fn selective_value_triple_exists(
+        &self,
+        head: [u32; 5],
+        triple: &ValueTriple,
+    ) -> io::Result<bool> {
+        use tdb_succinct::TypedDictEntry;
+
+        // chain is base-first; compute the cumulative node+value and predicate
+        // counts *below* each layer (the global-id offset for entries it owns).
+        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let ls = &self.layer_store;
+        let mut off_nv = Vec::with_capacity(chain.len());
+        let mut off_pred = Vec::with_capacity(chain.len());
+        let (mut cum_nv, mut cum_pred) = (0u64, 0u64);
+        for &layer in &chain {
+            off_nv.push(cum_nv);
+            off_pred.push(cum_pred);
+            cum_nv += ls.get_node_count(layer).await?.unwrap_or(0)
+                + ls.get_value_count(layer).await?.unwrap_or(0);
+            cum_pred += ls.get_predicate_count(layer).await?.unwrap_or(0);
+        }
+
+        // Resolve a node string (used for subjects and node objects).
+        async fn resolve_node(
+            ls: &Arc<dyn LayerStore>,
+            chain: &[[u32; 5]],
+            off_nv: &[u64],
+            s: &str,
+        ) -> io::Result<Option<u64>> {
+            for i in (0..chain.len()).rev() {
+                if let Some(dict) = ls.get_node_dictionary(chain[i]).await? {
+                    if let Some(local) = dict.id(&s).into_option() {
+                        let outer = match ls.get_node_value_idmap(chain[i]).await? {
+                            Some(m) => m.inner_to_outer(local),
+                            None => local,
+                        };
+                        return Ok(Some(outer + off_nv[i]));
+                    }
+                }
+            }
+            Ok(None)
+        }
+
+        let subject = match resolve_node(ls, &chain, &off_nv, &triple.subject).await? {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+
+        // Resolve the predicate.
+        let predicate = {
+            let mut found = None;
+            for i in (0..chain.len()).rev() {
+                if let Some(dict) = ls.get_predicate_dictionary(chain[i]).await? {
+                    let p: &str = &triple.predicate;
+                    if let Some(local) = dict.id(&p).into_option() {
+                        let outer = match ls.get_predicate_idmap(chain[i]).await? {
+                            Some(m) => m.inner_to_outer(local),
+                            None => local,
+                        };
+                        found = Some(outer + off_pred[i]);
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(id) => id,
+                None => return Ok(false),
+            }
+        };
+
+        // Resolve the object (node or typed value).
+        let object = match &triple.object {
+            ObjectType::Node(n) => match resolve_node(ls, &chain, &off_nv, n).await? {
+                Some(id) => id,
+                None => return Ok(false),
+            },
+            ObjectType::Value(v) => {
+                let v: &TypedDictEntry = v;
+                let mut found = None;
+                for i in (0..chain.len()).rev() {
+                    if let Some(vdict) = ls.get_value_dictionary(chain[i]).await? {
+                        if let Some(local) = vdict.id_entry(v).into_option() {
+                            // values live above this layer's nodes in the id-map's
+                            // input space, hence the `+ node_dict_len` shift.
+                            let node_len = ls.get_node_count(chain[i]).await?.unwrap_or(0);
+                            let combined = local + node_len;
+                            let outer = match ls.get_node_value_idmap(chain[i]).await? {
+                                Some(m) => m.inner_to_outer(combined),
+                                None => combined,
+                            };
+                            found = Some(outer + off_nv[i]);
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some(id) => id,
+                    None => return Ok(false),
+                }
+            }
+        };
+
+        self.selective_id_triple_exists(head, IdTriple::new(subject, predicate, object))
+            .await
+    }
+
     /// Spawn a background task that keeps read depth bounded: every `interval`
     /// it rolls up (non-destructively) any label head whose effective layer
     /// stack exceeds `max_depth`. Returns the task handle; abort it to stop.
@@ -1286,6 +1404,174 @@ mod tests {
                 .expect("all strings in these candidates exist in the dictionary");
             let got = store.selective_id_triple_exists(head, idt).await.unwrap();
             assert_eq!(expected, got, "mismatch for {:?}", cand);
+        }
+    }
+
+    #[tokio::test]
+    async fn selective_value_triple_exists_matches_full_layer() {
+        use tdb_succinct::{TdbDataType, TypedDictEntry};
+
+        let store = open_memory_store();
+        let db = store.create("g").await.unwrap();
+
+        let vs = |s: &str, p: &str, o: &str| ValueTriple::new_string_value(s, p, o);
+        let vn = |s: &str, p: &str, o: &str| ValueTriple::new_node(s, p, o);
+        let vv = |s: &str, p: &str, i: i32| -> ValueTriple {
+            ValueTriple::new_value(s, p, <i32 as TdbDataType>::make_entry(&i))
+        };
+
+        // base: nodes, string values, and typed (i32) values
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..40 {
+            builder
+                .add_value_triple(vs(&format!("n{}", i), "p", &format!("str{}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vn(&format!("n{}", i), "rel", &format!("n{}", (i + 1) % 40)))
+                .unwrap();
+            builder
+                .add_value_triple(vv(&format!("n{}", i), "age", i))
+                .unwrap();
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        // child: add more, remove some (nodes and typed values)
+        let builder = layer.open_write().await.unwrap();
+        for i in 40..60 {
+            builder
+                .add_value_triple(vs(&format!("n{}", i), "p", &format!("str{}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vv(&format!("n{}", i), "age", i))
+                .unwrap();
+        }
+        for i in 0..10 {
+            builder
+                .remove_value_triple(vv(&format!("n{}", i), "age", i))
+                .unwrap();
+            builder
+                .remove_value_triple(vn(&format!("n{}", i), "rel", &format!("n{}", (i + 1) % 40)))
+                .unwrap();
+        }
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        // child2: re-add a removed one, add a fresh string
+        let builder = layer.open_write().await.unwrap();
+        builder.add_value_triple(vv("n0", "age", 0)).unwrap();
+        builder.add_value_triple(vs("z", "zz", "zzz")).unwrap();
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+
+        // Candidates: present + absent across all three object kinds.
+        let mut candidates: Vec<ValueTriple> = Vec::new();
+        for i in 0..65 {
+            candidates.push(vs(&format!("n{}", i), "p", &format!("str{}", i)));
+            candidates.push(vn(&format!("n{}", i), "rel", &format!("n{}", (i + 1) % 40)));
+            candidates.push(vv(&format!("n{}", i), "age", i));
+        }
+        candidates.push(vs("n0", "p", "str1")); // resolvable, absent triple
+        candidates.push(vv("n5", "age", 999)); // absent typed value
+        candidates.push(vs("absent", "p", "x")); // absent subject
+        candidates.push(vn("n0", "rel", "n1")); // removed -> absent
+        candidates.push(vv("n0", "age", 0)); // removed then re-added -> present
+        candidates.push(vs("z", "zz", "zzz")); // present (child2)
+
+        for cand in &candidates {
+            let expected = full.value_triple_exists(cand);
+            let got = store
+                .selective_value_triple_exists(head, cand)
+                .await
+                .unwrap();
+            assert_eq!(
+                expected, got,
+                "mismatch for {:?} (expected {})",
+                cand, expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selective_value_triple_exists_matches_full_layer_randomized() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use tdb_succinct::{TdbDataType, TypedDictEntry};
+
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let store = open_memory_store();
+        let db = store.create("g").await.unwrap();
+
+        // Build a random multi-layer graph, remembering every triple ever added
+        // so we can use them (plus random absent ones) as candidates.
+        let mut candidates: Vec<ValueTriple> = Vec::new();
+        let mk = |kind: u8, a: u32, b: u32, rng: &mut StdRng| -> ValueTriple {
+            let s = format!("s{}", a % 40);
+            let p = format!("p{}", b % 6);
+            match kind % 3 {
+                0 => ValueTriple::new_node(&s, &p, &format!("s{}", rng.gen_range(0..40))),
+                1 => ValueTriple::new_string_value(&s, &p, &format!("v{}", rng.gen_range(0..50))),
+                _ => ValueTriple::new_value(
+                    &s,
+                    &p,
+                    <i32 as TdbDataType>::make_entry(&(rng.gen_range(0..100) as i32)),
+                ),
+            }
+        };
+
+        let mut head = None;
+        for _layer in 0..5 {
+            let builder = match head {
+                None => store.create_base_layer().await.unwrap(),
+                Some(h) => store
+                    .get_layer_from_id(h)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .open_write()
+                    .await
+                    .unwrap(),
+            };
+            for _ in 0..30 {
+                let t = mk(rng.gen(), rng.gen(), rng.gen(), &mut rng);
+                builder.add_value_triple(t.clone()).unwrap();
+                candidates.push(t);
+            }
+            // remove some previously-added triples
+            for _ in 0..8 {
+                if let Some(t) = candidates.get(rng.gen_range(0..candidates.len())).cloned() {
+                    builder.remove_value_triple(t).unwrap();
+                }
+            }
+            let layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+            head = Some(layer.name());
+        }
+        let head = head.unwrap();
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+
+        // add some certainly-absent candidates
+        for _ in 0..30 {
+            candidates.push(ValueTriple::new_string_value(
+                &format!("s{}", rng.gen_range(0..40)),
+                &format!("p{}", rng.gen_range(0..6)),
+                &format!("absent{}", rng.gen_range(0..1000)),
+            ));
+        }
+
+        for cand in &candidates {
+            let expected = full.value_triple_exists(cand);
+            let got = store
+                .selective_value_triple_exists(head, cand)
+                .await
+                .unwrap();
+            assert_eq!(
+                expected, got,
+                "mismatch for {:?} (expected {})",
+                cand, expected
+            );
         }
     }
 
