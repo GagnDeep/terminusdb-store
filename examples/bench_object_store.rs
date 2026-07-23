@@ -32,9 +32,17 @@
 //!
 //! Config (all optional; unset endpoint -> in-memory):
 //!   TDB_OBJECT_STORE_ENDPOINT / _BUCKET / _ACCESS_KEY_ID / _SECRET_ACCESS_KEY / _REGION
-//!   BENCH_DEPTH   (layer-chain depth, default 12)
-//!   BENCH_REPS    (repetitions per read scenario, default 20)
-//!   BENCH_WRITES  (small commits in the write scenario, default 50)
+//!   BENCH_DEPTH        (layer-chain depth, default 12)
+//!   BENCH_BASE         (base-layer entries, default 3000; keep > 512 for block-lazy)
+//!   BENCH_REPS         (repetitions per read scenario, default 20)
+//!   BENCH_WRITES       (small commits in the write scenario, default 50)
+//!   BENCH_CONCURRENCY  (queries in flight in the load test, default 1)
+//!   BENCH_LOAD         (total queries in the load test, default 400)
+//!
+//! The load test reports **object-store requests/second** — the throttling
+//! signal. On real S3/R2 (GET-per-prefix caps), bump BENCH_CONCURRENCY until the
+//! p99 inflates (backoff) or errors appear; the request/s figure tells you
+//! whether request coalescing is needed.
 
 #[cfg(not(feature = "object-store"))]
 fn main() {
@@ -50,6 +58,7 @@ async fn main() {
 #[cfg(feature = "object-store")]
 mod harness {
     use std::env;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -304,6 +313,9 @@ mod harness {
         let depth = env_usize("BENCH_DEPTH", 12);
         let reps = env_usize("BENCH_REPS", 20);
         let writes = env_usize("BENCH_WRITES", 50);
+        let base = env_usize("BENCH_BASE", 3000);
+        let concurrency = env_usize("BENCH_CONCURRENCY", 1);
+        let load_queries = env_usize("BENCH_LOAD", 400);
         let (raw, desc) = base_store();
         let meter = Arc::new(Meter::default());
         let prefix = format!("bench/{:016x}", rand::random::<u64>());
@@ -349,7 +361,99 @@ mod harness {
         }
 
         write_scenario(&metered, &prefix, &meter, writes).await;
+
+        // Concurrent load: the real throttling signal. Many queries in flight at
+        // once drive requests/second up; on real S3/R2 that is where 503
+        // SlowDown appears (as backoff-inflated tail latency, or errors if
+        // retries exhaust). Bump BENCH_CONCURRENCY for the cloud run.
+        load_scenario(
+            &metered,
+            &prefix,
+            head,
+            &meter,
+            concurrency,
+            load_queries,
+            base,
+        )
+        .await;
+
         println!("\n=== done ===");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn load_scenario(
+        store: &Arc<dyn ObjectStore>,
+        prefix: &str,
+        head: [u32; 5],
+        meter: &Arc<Meter>,
+        concurrency: usize,
+        total: usize,
+        base: usize,
+    ) {
+        // One shared cold store (cache 0) serving many concurrent queries — the
+        // realistic disk-less replica under load. Metadata caches (header/count)
+        // warm up; block reads still hit the bucket, and each query varies its
+        // terms so the caches do not absorb the load.
+        let s = Arc::new(open_object_store(store.clone(), prefix.to_string(), 0));
+        meter.take();
+        let next = Arc::new(AtomicUsize::new(0));
+        let errors = Arc::new(AtomicUsize::new(0));
+        let latencies = Arc::new(Mutex::new(Vec::with_capacity(total)));
+
+        let t = Instant::now();
+        let mut workers = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency.max(1) {
+            let (s, next, errors, lat) =
+                (s.clone(), next.clone(), errors.clone(), latencies.clone());
+            workers.push(tokio::spawn(async move {
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= total {
+                        break;
+                    }
+                    // present triple, term varied so different blocks are touched
+                    let k = i % base;
+                    let triple = ValueTriple::new_string_value(
+                        &format!("s{:05}", k),
+                        "p",
+                        &format!("o{:05}", k),
+                    );
+                    let qt = Instant::now();
+                    match s.selective_value_triple_exists(head, &triple).await {
+                        Ok(_) => lat.lock().unwrap().push(qt.elapsed().as_micros()),
+                        Err(_) => {
+                            errors.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }));
+        }
+        for w in workers {
+            let _ = w.await;
+        }
+        let elapsed = t.elapsed();
+        let reqs = meter.take().len() as f64;
+        let secs = elapsed.as_secs_f64().max(1e-9);
+        let mut lat = std::mem::take(&mut *latencies.lock().unwrap());
+        lat.sort_unstable();
+
+        println!(
+            "\nconcurrent load ({} queries, {} in flight)",
+            total, concurrency
+        );
+        println!(
+            "  throughput  {:.0} queries/s   {:.0} object-store requests/s",
+            total as f64 / secs,
+            reqs / secs,
+        );
+        println!(
+            "  query lat   p50 {}  p95 {}  p99 {}   errors: {}",
+            ms(pct(&lat, 0.50)),
+            ms(pct(&lat, 0.95)),
+            ms(pct(&lat, 0.99)),
+            errors.load(Ordering::SeqCst),
+        );
+        println!("  (requests/s is the throttling signal; real S3/R2 caps GETs per prefix)");
     }
 
     async fn build_chain(store: &Arc<dyn ObjectStore>, prefix: &str, depth: usize) -> [u32; 5] {
