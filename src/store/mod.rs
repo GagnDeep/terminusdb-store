@@ -1028,6 +1028,40 @@ pub fn open_directory_store<P: Into<PathBuf>>(path: P) -> Store {
     )
 }
 
+/// Open a store backed by an S3-compatible object store.
+///
+/// Layers are stored as single archive objects and labels as compare-and-swap
+/// objects, both under `prefix` in the given [`object_store::ObjectStore`]. The
+/// bucket is the source of truth and the sole coordinator between replicas.
+///
+/// `cache_size` specifies, in megabytes, how large the in-memory LRU cache of
+/// whole layer archives should be. Because layers are immutable, cached entries
+/// are only ever evicted, never invalidated.
+///
+/// Develop and test against `object_store::memory::InMemory` or
+/// `object_store::local::LocalFileSystem` for a network-free store; point it at
+/// an `AmazonS3Builder`-built store (with an endpoint override for R2/MinIO) for
+/// real object storage.
+#[cfg(feature = "object-store")]
+pub fn open_object_store(
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: impl Into<String>,
+    cache_size: usize,
+) -> Store {
+    use crate::storage::object::{ObjectArchiveBackend, ObjectLabelStore};
+    let prefix = prefix.into();
+    let object_backend = ObjectArchiveBackend::new(store.clone(), prefix.clone());
+    let archive_backend =
+        LruArchiveBackend::new(object_backend.clone(), object_backend, cache_size);
+    Store::new(
+        ObjectLabelStore::new(store, prefix),
+        CachedLayerStore::new(
+            ArchiveLayerStore::new(archive_backend.clone(), archive_backend),
+            LockingHashMapLayerCache::new(),
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
