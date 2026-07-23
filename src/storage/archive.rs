@@ -99,6 +99,13 @@ pub trait ArchiveMetadataBackend: Clone + Send + Sync {
     async fn on_layer_finalized(&self, _id: [u32; 5]) -> io::Result<()> {
         Ok(())
     }
+
+    /// Best-effort concurrent warm of rollup-pointer lookups for the given
+    /// layers, so a subsequent read resolves rollups without a sequential GET
+    /// per ancestor. Default no-op for backends without a rollup cache.
+    async fn prefetch_rollups(&self, _ids: &[[u32; 5]]) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct BytesAsyncReader(Bytes);
@@ -383,11 +390,17 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
 /// Maximum number of layer archives fetched concurrently during a prefetch wave.
 const PREFETCH_CONCURRENCY: usize = 16;
 
+/// Cache of rollup-pointer lookups (`layer -> Some(rollup) | None`).
+type RollupCache = Arc<tokio::sync::Mutex<LruCache<[u32; 5], Option<[u32; 5]>>>>;
+
 #[derive(Clone)]
 pub struct LruArchiveBackend<M, D> {
     cache: Arc<tokio::sync::Mutex<LruCache<[u32; 5], CacheEntry>>>,
-    #[cfg(feature = "rollup_metadata_experimental")]
-    rollup_cache: Arc<std::sync::RwLock<HashMap<[u32; 5], Option<[u32; 5]>>>>,
+    /// Rollup layers are content-addressed and immutable, so a cached pointer
+    /// stays valid; `set_rollup` keeps this in-process consistent. Lets a read
+    /// resolve the whole chain's rollups in one parallel wave instead of one
+    /// sequential GET per ancestor.
+    rollup_cache: RollupCache,
     limit: usize,
     current: Arc<AtomicUsize>,
     metadata_origin: M,
@@ -413,11 +426,13 @@ impl CacheEntry {
 impl<M, D> LruArchiveBackend<M, D> {
     pub fn new(metadata_origin: M, data_origin: D, limit: usize) -> Self {
         let cache = Arc::new(tokio::sync::Mutex::new(LruCache::unbounded()));
+        let rollup_cache = Arc::new(tokio::sync::Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(100_000).unwrap(),
+        )));
 
         Self {
             cache,
-            #[cfg(feature = "rollup_metadata_experimental")]
-            rollup_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            rollup_cache,
             limit,
             current: Arc::new(AtomicUsize::new(0)),
             metadata_origin,
@@ -729,25 +744,26 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
         }
     }
     async fn get_rollup(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
-        #[cfg(feature = "rollup_metadata_experimental")]
-        {
-            if let Some(cached) = self.rollup_cache.read().unwrap().get(&id) {
-                return Ok(*cached);
-            }
+        if let Some(cached) = self.rollup_cache.lock().await.get(&id) {
+            return Ok(*cached);
         }
         let result = self.metadata_origin.get_rollup(id).await?;
-        #[cfg(feature = "rollup_metadata_experimental")]
-        {
-            self.rollup_cache.write().unwrap().insert(id, result);
-        }
+        self.rollup_cache.lock().await.put(id, result);
         Ok(result)
     }
     async fn set_rollup(&self, id: [u32; 5], rollup: [u32; 5]) -> io::Result<()> {
         self.metadata_origin.set_rollup(id, rollup).await?;
-        #[cfg(feature = "rollup_metadata_experimental")]
-        {
-            self.rollup_cache.write().unwrap().insert(id, Some(rollup));
-        }
+        // Keep the rollup cache in-process consistent with the write.
+        self.rollup_cache.lock().await.put(id, Some(rollup));
+        Ok(())
+    }
+    async fn prefetch_rollups(&self, ids: &[[u32; 5]]) -> io::Result<()> {
+        use futures::stream::StreamExt;
+        futures::stream::iter(ids.iter().copied())
+            .for_each_concurrent(PREFETCH_CONCURRENCY, |id| async move {
+                let _ = self.get_rollup(id).await;
+            })
+            .await;
         Ok(())
     }
 
@@ -1661,7 +1677,14 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
         if let Some(bytes) = self.metadata_backend.get_stack_manifest(name).await? {
             if let Some(manifest) = crate::storage::stack_manifest::StackManifest::decode(bytes) {
                 if manifest.is_for(name) {
-                    self.data_backend.prefetch_layers(&manifest.layers).await?;
+                    // Warm archives and rollup pointers in parallel, so the
+                    // sequential discovery walk hits both caches.
+                    let (data, meta) = futures::join!(
+                        self.data_backend.prefetch_layers(&manifest.layers),
+                        self.metadata_backend.prefetch_rollups(&manifest.layers),
+                    );
+                    data?;
+                    meta?;
                 }
             }
         }
@@ -1693,7 +1716,9 @@ mod tests {
         assert!(!header.is_present(LayerFileEnum::NodeDictionaryOffsets));
     }
 
-    #[cfg(feature = "rollup_metadata_experimental")]
+    // Upstream gated the rollup-pointer cache behind `rollup_metadata_experimental`.
+    // Here it is unconditional (bounded LRU + parallel prefetch), so these tests
+    // run unconditionally too.
     mod rollup_metadata_cache_tests {
         use super::*;
         use std::sync::atomic::AtomicUsize;
