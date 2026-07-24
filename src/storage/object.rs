@@ -1518,6 +1518,32 @@ mod tests {
             e.1 += end - start;
         }
 
+        // How do those requests spread across S3 key prefixes? Layer objects are
+        // keyed `<first-3-hex>/<name>.larch`, so they are already distributed
+        // over 4096 prefixes -- which is what the per-prefix rate limit applies
+        // to, and therefore what decides the throttling ceiling.
+        let mut by_prefix: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for (k, _, _) in ranges.lock().unwrap().iter() {
+            let pfx = k
+                .rsplit_once('/')
+                .map(|(a, _)| a.to_string())
+                .unwrap_or_default();
+            *by_prefix.entry(pfx).or_default() += 1;
+        }
+        let busiest = by_prefix.values().copied().max().unwrap_or(0);
+        println!(
+            "\nrequests spread over {} key prefixes; busiest prefix took {} of {} requests",
+            by_prefix.len(),
+            busiest,
+            total_requests
+        );
+        println!(
+            "  => at S3's ~5500 GET/s per prefix, the busiest prefix caps this query \
+class at ~{} queries/s",
+            if busiest > 0 { 5500 / busiest } else { 0 }
+        );
+
         let mut rows: Vec<_> = by_structure.into_iter().collect();
         rows.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
         println!(

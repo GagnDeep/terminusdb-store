@@ -124,15 +124,32 @@ linearly — that ceiling is MinIO's, single-node on loopback, not S3's.
 
 **The number that transfers is requests per query: ~350** for a selective
 existence check on a 12-layer chain. That is a property of this code, not of the
-backend. Against S3's documented ~5,500 GET/s per prefix:
+backend, and a *single-threaded* query stream measured 6,660 requests/s — above
+S3's documented ~5,500 GET/s per prefix. So the disk-less path does trade bytes
+for request count, and request count is what S3 rate-limits.
 
-> **~5,500 ÷ 350 ≈ 15 disk-less queries per second per prefix** before AWS
-> starts returning 503 SlowDown.
+**But dividing that whole-query rate by the per-prefix cap overstates the
+problem, and an earlier version of this document did exactly that.** S3's limit
+applies per prefix, and layer objects are already keyed
+`<first-3-hex-of-name>/<name>.larch` — names are content hashes, so objects are
+spread over 4,096 prefixes. A query's requests therefore land on roughly as many
+prefixes as it touches layers. Measured on the 12-layer chain
+(`profile_selective_request_breakdown` reports it):
 
-Even a *single-threaded* query stream measured 6,660 requests/s here, already
-above the per-prefix cap. This confirms, with measurements rather than
-arithmetic, the risk flagged in the object-store RFC: the disk-less path trades
-bytes for request count, and request count is what S3 rate-limits.
+| | requests | prefixes touched | busiest prefix | implied ceiling |
+|---|---|---|---|---|
+| coalescing off | 369 | 12 | 39 | ~141 queries/s |
+| coalescing on | 87 | 12 | 10 | **~550 queries/s** |
+
+So the ceiling is set by the *busiest* prefix, not the query total: roughly
+**550 disk-less queries per second** on one graph with coalescing on, about 4×
+better than without it, and an order of magnitude better than the naive
+whole-query division suggested.
+
+Two caveats. Every query on a given graph hits that same set of layer prefixes,
+so this is a per-graph ceiling; unrelated graphs use different layers and
+different prefixes. And AWS partitions dynamically rather than giving each key
+prefix a fixed budget, so only a real S3 run can confirm the number.
 
 ### Request coalescing — implemented
 
@@ -156,8 +173,8 @@ at concurrency 4, toggled with `TDB_COALESCE_MAX_STRUCTURE_BYTES`:
 | object-store req/s | 19,459 | **9,382** | half the pressure |
 
 The last two rows together are the point: **5.3× the throughput at half the
-request rate**. The S3 ceiling moves from ~15 to **~63 disk-less queries per
-second per prefix** (5,500 ÷ 87).
+request rate**. On the per-prefix measurement above, the ceiling moves from ~141 to **~550
+disk-less queries per second**.
 
 **This is a trade, not a free win.** Coalescing fetches whole small structures
 where the uncoalesced path took only the bytes it needed, so byte transfer rises
@@ -169,11 +186,11 @@ the wrong one where bytes are scarce. Hence the knob:
 Note this invalidates the "a selective read moves ~8% of a full layer" claim
 *when coalescing is on*. With it off, that claim still holds.
 
-Still not implemented:
-
-- **Prefix sharding** — S3's limit is per prefix, so distributing layer objects
-  across N prefixes multiplies the ceiling by roughly N. Cheap, and independent
-  of coalescing; the two multiply.
+**Prefix sharding is already in place** and was mistaken for future work when
+this document first flagged it: `layer_key` has always keyed objects by the
+first three hex characters of the layer name, which is exactly the pattern AWS
+recommends for spreading load across partitions. There is nothing to add there;
+the measurement above already reflects it.
 
 The materialized path pays 522 requests once and then serves from cache; the
 disk-less path pays ~350 per query. That is the real trade, and it argues for
