@@ -2189,6 +2189,67 @@ impl LazyLayer {
             .await
     }
 
+    /// Materialize this layer.
+    ///
+    /// This is the escape hatch for operations that inherently need a whole
+    /// layer -- building a child on top of it, squashing, rolling up -- and it
+    /// costs exactly what the disk-less path otherwise avoids. Reads should
+    /// never need it.
+    pub async fn materialize(&self) -> io::Result<Option<StoreLayer>> {
+        self.store.get_layer_from_id(self.head).await
+    }
+
+    /// This layer's own addition count -- not the chain's. One metadata read.
+    pub async fn triple_layer_addition_count(&self) -> io::Result<usize> {
+        self.store
+            .layer_store
+            .triple_layer_addition_count(self.head)
+            .await
+    }
+
+    /// This layer's own removal count -- not the chain's. One metadata read.
+    pub async fn triple_layer_removal_count(&self) -> io::Result<usize> {
+        self.store
+            .layer_store
+            .triple_layer_removal_count(self.head)
+            .await
+    }
+
+    /// Additions across the whole chain, as [`Layer::triple_addition_count`]
+    /// reports it. Sums the per-layer counts concurrently rather than
+    /// materializing anything.
+    pub async fn triple_addition_count(&self) -> io::Result<usize> {
+        Ok(self.chain_triple_counts().await?.0)
+    }
+
+    /// Removals across the whole chain, as [`Layer::triple_removal_count`]
+    /// reports it.
+    pub async fn triple_removal_count(&self) -> io::Result<usize> {
+        Ok(self.chain_triple_counts().await?.1)
+    }
+
+    /// Triples across the whole chain: additions minus removals, matching
+    /// [`Layer::triple_count`].
+    pub async fn triple_count(&self) -> io::Result<usize> {
+        let (adds, removes) = self.chain_triple_counts().await?;
+        Ok(adds - removes)
+    }
+
+    async fn chain_triple_counts(&self) -> io::Result<(usize, usize)> {
+        let chain = self.retrieve_layer_stack_names().await?;
+        let ls = &self.store.layer_store;
+        let per_layer = futures::future::try_join_all(chain.into_iter().map(|layer| async move {
+            futures::try_join!(
+                ls.triple_layer_addition_count(layer),
+                ls.triple_layer_removal_count(layer),
+            )
+        }))
+        .await?;
+        Ok(per_layer
+            .into_iter()
+            .fold((0, 0), |(aa, ar), (a, r)| (aa + a, ar + r)))
+    }
+
     /// This layer's parent as another disk-less handle, if it has one.
     pub async fn parent(&self) -> io::Result<Option<LazyLayer>> {
         Ok(self.parent_name().await?.map(|p| self.store.lazy_layer(p)))

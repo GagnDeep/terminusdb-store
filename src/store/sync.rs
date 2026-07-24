@@ -564,6 +564,24 @@ impl SyncLazyLayer {
     pub fn predicate_count(&self) -> io::Result<u64> {
         task_sync(self.inner.predicate_count())
     }
+    pub fn materialize(&self) -> io::Result<Option<SyncStoreLayer>> {
+        Ok(task_sync(self.inner.materialize())?.map(SyncStoreLayer::wrap))
+    }
+    pub fn triple_layer_addition_count(&self) -> io::Result<usize> {
+        task_sync(self.inner.triple_layer_addition_count())
+    }
+    pub fn triple_layer_removal_count(&self) -> io::Result<usize> {
+        task_sync(self.inner.triple_layer_removal_count())
+    }
+    pub fn triple_addition_count(&self) -> io::Result<usize> {
+        task_sync(self.inner.triple_addition_count())
+    }
+    pub fn triple_removal_count(&self) -> io::Result<usize> {
+        task_sync(self.inner.triple_removal_count())
+    }
+    pub fn triple_count(&self) -> io::Result<usize> {
+        task_sync(self.inner.triple_count())
+    }
     pub fn parent_name(&self) -> io::Result<Option<[u32; 5]>> {
         task_sync(self.inner.parent_name())
     }
@@ -1037,6 +1055,33 @@ mod tests {
 
         let full = store.get_layer_from_id(head).unwrap().unwrap(); // materialized head
         let lazy = store.lazy_layer(head); // disk-less
+
+        // counts across the chain, computed from per-layer metadata rather than
+        // by materializing anything
+        assert_eq!(
+            full.triple_addition_count(),
+            lazy.triple_addition_count().unwrap()
+        );
+        assert_eq!(
+            full.triple_removal_count(),
+            lazy.triple_removal_count().unwrap()
+        );
+        assert_eq!(full.triple_count(), lazy.triple_count().unwrap());
+        assert!(lazy.triple_removal_count().unwrap() > 0, "not vacuous");
+        assert_eq!(
+            full.triple_layer_addition_count().unwrap(),
+            lazy.triple_layer_addition_count().unwrap()
+        );
+        assert_eq!(
+            full.triple_layer_removal_count().unwrap(),
+            lazy.triple_layer_removal_count().unwrap()
+        );
+
+        // and the escape hatch really does yield the same layer
+        assert_eq!(
+            lazy.materialize().unwrap().map(|m| m.name()),
+            Some(full.name())
+        );
 
         // existence, without materializing: true for a real layer, false for a
         // well-formed name that was never stored (which is what store_id_layer
