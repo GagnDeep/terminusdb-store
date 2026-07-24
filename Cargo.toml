@@ -43,6 +43,9 @@ memmap2 = "0.9"
 [features]
 noreadlock = []
 eprint_log = []
+# Retained for compatibility with downstreams that enable it (TerminusDB does).
+# It is now a no-op: the rollup-pointer cache it used to gate is unconditional
+# here, and bounded (LRU) rather than an unbounded HashMap.
 rollup_metadata_experimental = []
 object-store = ["dep:object_store"]
 

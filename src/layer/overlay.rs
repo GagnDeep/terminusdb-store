@@ -172,6 +172,34 @@ impl OverlayLayer {
         v.sort();
         v
     }
+
+    /// Buffered additions whose object value lies in `[low, high)`, in ascending
+    /// value order.
+    ///
+    /// The bound test is done on the value rather than on the object id: an
+    /// addition may carry a *provisional* id that the overlay minted for a value
+    /// the parent does not have, and those ids are allocated in insertion order,
+    /// so they say nothing about where the value sorts.
+    fn additions_in_value_range(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> Vec<IdTriple> {
+        let mut matched: Vec<(TypedDictEntry, IdTriple)> = self
+            .additions
+            .iter()
+            .filter_map(|t| match self.id_object(t.object) {
+                Some(ObjectType::Value(v))
+                    if v.datatype() == low.datatype() && v >= *low && v < *high =>
+                {
+                    Some((v, *t))
+                }
+                _ => None,
+            })
+            .collect();
+        matched.sort();
+        matched.into_iter().map(|(_, t)| t).collect()
+    }
 }
 
 impl Layer for OverlayLayer {
@@ -348,6 +376,37 @@ impl Layer for OverlayLayer {
         )
     }
 
+    fn triples_value_range(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> Box<dyn Iterator<Item = IdTriple> + Send> {
+        let removals = self.removals.clone();
+        let additions = self.additions_in_value_range(low, high);
+        Box::new(
+            self.parent
+                .triples_value_range(low, high)
+                .filter(move |t| !removals.contains(t))
+                .chain(additions),
+        )
+    }
+
+    fn triples_value_range_rev(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> Box<dyn Iterator<Item = IdTriple> + Send> {
+        let removals = self.removals.clone();
+        let mut additions = self.additions_in_value_range(low, high);
+        additions.reverse();
+        Box::new(
+            self.parent
+                .triples_value_range_rev(low, high)
+                .filter(move |t| !removals.contains(t))
+                .chain(additions),
+        )
+    }
+
     fn triple_addition_count(&self) -> usize {
         self.parent.triple_addition_count() + self.additions.len()
     }
@@ -365,6 +424,7 @@ mod tests {
     use super::*;
     use crate::storage::memory::MemoryLayerStore;
     use crate::storage::{CachedLayerStore, LayerStore, LockingHashMapLayerCache};
+    use tdb_succinct::TdbDataType;
 
     // Build a real committed child from `ops` on top of `base`, for comparison.
     async fn real_child(
@@ -413,6 +473,33 @@ mod tests {
         // spot-check existence both ways
         for t in &r {
             assert!(overlay.value_triple_exists(t), "overlay missing {:?}", t);
+        }
+
+        // Value-range queries must agree as sets. Compared as strings because ids
+        // differ between the two, and sorted because the overlay appends its
+        // buffered additions after the parent's results rather than merging them
+        // in value order.
+        let low = String::make_entry(&"");
+        let high = String::make_entry(&"zzzzzzzz");
+        for rev in [false, true] {
+            let mut o: Vec<ValueTriple> = if rev {
+                overlay.triples_value_range_rev(&low, &high)
+            } else {
+                overlay.triples_value_range(&low, &high)
+            }
+            .map(|t| overlay.id_triple_to_string(&t).unwrap())
+            .collect();
+            let mut r: Vec<ValueTriple> = if rev {
+                real.triples_value_range_rev(&low, &high)
+            } else {
+                real.triples_value_range(&low, &high)
+            }
+            .map(|t| real.id_triple_to_string(&t).unwrap())
+            .collect();
+            o.sort();
+            r.sort();
+            assert!(!r.is_empty(), "value-range check is vacuous (rev={})", rev);
+            assert_eq!(r, o, "value-range results differ (rev={rev})");
         }
     }
 
