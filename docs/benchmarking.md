@@ -11,6 +11,8 @@ environment, and reports for each query class:
 
 It covers a cold whole-layer read (the old path), selective existence (present and absent — disk-less), a full scan (disk-less), durable batched writes through a **bucket-backed WAL** (disk-less), and a **concurrent load test** that drives many queries in flight and reports **object-store requests/second** — the number that predicts request-rate throttling.
 
+For *why* warm reads barely touch the object store — the per-replica RAM caches and the immutability that makes them correct without invalidation — see [`caching-architecture.md`](caching-architecture.md).
+
 ## The three tiers
 
 ### 1. In-memory (default) — correctness + request/byte accounting, zero setup
