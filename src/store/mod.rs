@@ -2009,6 +2009,61 @@ impl LazyLayer {
         self.head
     }
 
+    // ---- chain metadata ----
+
+    /// The size of the node/value id space, i.e. the cumulative node + value
+    /// count over the whole ancestor chain, as [`Layer::node_and_value_count`]
+    /// reports it. Reads only the per-layer counts -- immutable, and cached by
+    /// `CachedLayerStore` -- never a dictionary.
+    pub async fn node_and_value_count(&self) -> io::Result<u64> {
+        let (nodes, values, _) = self.chain_count_totals().await?;
+        Ok(nodes + values)
+    }
+
+    /// The size of the predicate id space over the whole ancestor chain, as
+    /// [`Layer::predicate_count`] reports it.
+    pub async fn predicate_count(&self) -> io::Result<u64> {
+        Ok(self.chain_count_totals().await?.2)
+    }
+
+    /// Cumulative (nodes, values, predicates) over the whole ancestor chain.
+    /// The per-layer counts are fetched concurrently.
+    async fn chain_count_totals(&self) -> io::Result<(u64, u64, u64)> {
+        let chain = self.retrieve_layer_stack_names().await?;
+        let ls = &self.store.layer_store;
+        let per_layer = futures::future::try_join_all(chain.into_iter().map(|layer| async move {
+            let (n, v, p) = futures::try_join!(
+                ls.get_node_count(layer),
+                ls.get_value_count(layer),
+                ls.get_predicate_count(layer),
+            )?;
+            Ok::<_, io::Error>((n.unwrap_or(0), v.unwrap_or(0), p.unwrap_or(0)))
+        }))
+        .await?;
+        Ok(per_layer
+            .into_iter()
+            .fold((0, 0, 0), |(an, av, ap), (n, v, p)| {
+                (an + n, av + v, ap + p)
+            }))
+    }
+
+    /// This layer's parent, if it has one.
+    pub async fn parent_name(&self) -> io::Result<Option<[u32; 5]>> {
+        self.store
+            .layer_store
+            .get_layer_parent_name(self.head)
+            .await
+    }
+
+    /// The whole ancestor chain, head first — the same order
+    /// [`LayerStore::retrieve_layer_stack_names`] returns.
+    pub async fn retrieve_layer_stack_names(&self) -> io::Result<Vec<[u32; 5]>> {
+        self.store
+            .layer_store
+            .retrieve_layer_stack_names(self.head)
+            .await
+    }
+
     // ---- existence ----
     pub async fn triple_exists(
         &self,

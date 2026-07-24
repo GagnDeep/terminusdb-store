@@ -557,6 +557,20 @@ impl SyncLazyLayer {
         self.inner.name()
     }
 
+    // ---- chain metadata ----
+    pub fn node_and_value_count(&self) -> io::Result<u64> {
+        task_sync(self.inner.node_and_value_count())
+    }
+    pub fn predicate_count(&self) -> io::Result<u64> {
+        task_sync(self.inner.predicate_count())
+    }
+    pub fn parent_name(&self) -> io::Result<Option<[u32; 5]>> {
+        task_sync(self.inner.parent_name())
+    }
+    pub fn retrieve_layer_stack_names(&self) -> io::Result<Vec<[u32; 5]>> {
+        task_sync(self.inner.retrieve_layer_stack_names())
+    }
+
     // ---- existence ----
     pub fn triple_exists(&self, subject: u64, predicate: u64, object: u64) -> io::Result<bool> {
         task_sync(self.inner.triple_exists(subject, predicate, object))
@@ -958,6 +972,26 @@ mod tests {
 
         let full = store.get_layer_from_id(head).unwrap().unwrap(); // materialized head
         let lazy = store.lazy_layer(head); // disk-less
+
+        // chain metadata over a real base+child chain, so the cumulative sums
+        // are actually exercised rather than trivially matching a single layer
+        assert!(full.parent().unwrap().is_some());
+        assert_eq!(
+            full.parent().unwrap().map(|p| p.name()),
+            lazy.parent_name().unwrap()
+        );
+        assert_eq!(
+            full.node_and_value_count() as u64,
+            lazy.node_and_value_count().unwrap()
+        );
+        assert_eq!(
+            full.predicate_count() as u64,
+            lazy.predicate_count().unwrap()
+        );
+        assert_eq!(
+            full.retrieve_layer_stack_names().unwrap(),
+            lazy.retrieve_layer_stack_names().unwrap()
+        );
 
         let sorted = |it: Box<dyn Iterator<Item = IdTriple> + Send>| {
             let mut v: Vec<IdTriple> = it.collect();
