@@ -56,3 +56,7 @@ required-features = ["object-store"]
 [[example]]
 name = "bench_object_store"
 required-features = ["object-store"]
+
+[[example]]
+name = "probe_s3_latency"
+required-features = ["object-store"]

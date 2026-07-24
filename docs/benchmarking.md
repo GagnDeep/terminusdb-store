@@ -197,6 +197,67 @@ disk-less path pays ~350 per query. That is the real trade, and it argues for
 disk-less on large-working-set / low-QPS workloads rather than as a blanket
 default.
 
+## Measured: real AWS S3 (read-only calibration)
+
+Every latency figure above comes from MinIO on loopback, where a request costs
+~0.5 ms. That understates a real deployment badly, so this calibrates the
+per-request constant against genuine AWS S3.
+
+**Why only a calibration.** There is no publicly available S3-compatible
+endpoint that accepts *writes*, so a graph cannot be staged on one and the full
+harness cannot run. MinIO's `play.min.io` playground would have been the
+candidate, but its published credentials are now rejected
+(`SignatureDoesNotMatch`) and anonymous access returns 403. What *is* available
+is anonymous **reads** from AWS Open Data buckets, which is enough to measure
+what dominates a disk-less query: ranged-GET latency.
+
+`examples/probe_s3_latency.rs`, against `s3://noaa-gfs-bdp-pds` (us-east-1),
+8 KiB ranged reads matching the small per-layer structures:
+
+| in flight | per-request p50 | p95 | throughput |
+|---|---|---|---|
+| 1 (warm connection) | **124.9 ms** | 133.2 ms | 8 req/s |
+| 8 | 127.6 ms | 335.4 ms | 54 req/s |
+| 16 | 127.8 ms | 346.9 ms | 83 req/s |
+| 32 | 129.9 ms | 352.9 ms | 150 req/s |
+| 64 | 381.3 ms | 405.3 ms | 183 req/s |
+
+The 125 ms is round-trip time from this host to us-east-1 — a machine on
+another continent. **It is not a deployment number**; compute co-located with
+its bucket sees ~0.5–2 ms. The ~180 req/s ceiling is this host's egress and
+connection pool, not S3 throttling.
+
+### What it means for the disk-less path
+
+Query cost is `requests x RTT / effective concurrency`, and the request count is
+now measured at 87 per selective query:
+
+| deployment | RTT | implied query cost |
+|---|---|---|
+| compute co-located with bucket | ~1 ms | **~3 ms** at concurrency 32 |
+| cross-continent (measured here) | 125 ms | ~580 ms at concurrency 32 |
+| cross-continent, fully serial | 125 ms | 10.9 s |
+
+Two conclusions, both actionable:
+
+- **Co-locate compute with the bucket.** The disk-less path is round-trip-bound
+  by construction, so cross-region deployment is not a slower configuration, it
+  is a broken one. A materialized replica tolerates distance because it pays the
+  round trips once; the disk-less path pays them per query.
+- **Concurrency is necessary but not sufficient.** It helps sub-linearly here
+  and saturates around 180 req/s, so it cannot rescue a high-RTT deployment. It
+  is what makes a co-located one fast.
+
+This also re-validates the coalescing work independently of any throttling
+argument: 350 to 87 requests is a 4x cut in the term that dominates the cost.
+
+### Still unanswered
+
+The throttling ceiling. That needs sustained writes and load against a bucket
+you control, which needs your credentials — the one thing no public endpoint
+can substitute for. The question is now sharp: does a 12-layer disk-less graph
+sustain roughly 550 queries/s against real S3 before 503 SlowDown appears?
+
 ## Knobs
 
 | Env var | Default | Meaning |
