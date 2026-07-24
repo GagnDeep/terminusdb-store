@@ -1413,7 +1413,10 @@ mod tests {
         use crate::storage::consts::LayerFileEnum;
         use num_traits::FromPrimitive;
 
-        const DEPTH: usize = 12;
+        let depth: usize = std::env::var("PROFILE_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let (head, chain) = {
             let store = crate::store::open_object_store(bucket.clone(), "", 1 << 30);
@@ -1430,7 +1433,7 @@ mod tests {
             }
             let mut layer = builder.commit().await.unwrap();
             db.set_head(&layer).await.unwrap();
-            for d in 1..DEPTH {
+            for d in 1..depth {
                 let b = layer.open_write().await.unwrap();
                 for i in 0..20 {
                     b.add_value_triple(ValueTriple::new_string_value(
@@ -1548,7 +1551,7 @@ class at ~{} queries/s",
         rows.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
         println!(
             "\nselective existence over {} layers: {} requests, {} bytes",
-            DEPTH, total_requests, total_bytes
+            depth, total_requests, total_bytes
         );
         println!("{:<45} {:>8} {:>10}", "structure", "requests", "bytes");
         for (name, (n, b)) in &rows {
