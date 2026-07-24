@@ -38,6 +38,7 @@
 //!   BENCH_WRITES       (small commits in the write scenario, default 50)
 //!   BENCH_CONCURRENCY  (queries in flight in the load test, default 1)
 //!   BENCH_LOAD         (total queries in the load test, default 400)
+//!   BENCH_ROLLUP       (1 = also measure after rollup, default 1)
 //!
 //! The load test reports **object-store requests/second** — the throttling
 //! signal. On real S3/R2 (GET-per-prefix caps), bump BENCH_CONCURRENCY until the
@@ -361,6 +362,52 @@ mod harness {
         }
 
         write_scenario(&metered, &prefix, &meter, writes).await;
+
+        // Rollup, then re-measure the same queries on the same data.
+        //
+        // Read cost scales with chain depth, and rollup collapses the chain into
+        // one layer *without* discarding the originals -- the audit trail
+        // survives, which is the whole reason this engine does not squash. This
+        // is the difference between the depth the benchmark builds and the depth
+        // a maintained deployment actually runs at.
+        if env_usize("BENCH_ROLLUP", 1) != 0 {
+            let s = open_object_store(metered.clone(), prefix.clone(), 0);
+            let layer = s
+                .get_layer_from_id(head)
+                .await
+                .expect("get head")
+                .expect("head exists");
+            meter.take();
+            let t = Instant::now();
+            layer.clone().rollup().await.expect("rollup");
+            let rollup_reqs = meter.take().len();
+            println!(
+                "\nrollup of a {}-layer chain: {} ({} object-store requests)",
+                depth,
+                ms(t.elapsed().as_micros()),
+                rollup_reqs
+            );
+
+            println!("\n--- the same queries, after rollup ---");
+            for name in [
+                "selective existence, present (disk-less)",
+                "selective existence, absent (full chain walk)",
+                "full scan (disk-less)",
+            ] {
+                read_scenario(name, reps, &meter, fresh).await;
+            }
+
+            load_scenario(
+                &metered,
+                &prefix,
+                head,
+                &meter,
+                concurrency,
+                load_queries,
+                base,
+            )
+            .await;
+        }
 
         // Concurrent load: the real throttling signal. Many queries in flight at
         // once drive requests/second up; on real S3/R2 that is where 503

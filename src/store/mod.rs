@@ -3719,6 +3719,73 @@ mod tests {
         );
     }
 
+    /// After a rollup, the materialized path reads through the rollup layer
+    /// while the disk-less path still walks the original chain. If those two
+    /// disagree about ids or membership, disk-less reads are wrong on any graph
+    /// that has ever been rolled up -- which is every maintained graph.
+    #[tokio::test]
+    async fn disk_less_reads_agree_with_materialized_after_rollup() {
+        let store = open_memory_store();
+        let db = store.create("g").await.unwrap();
+
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..50 {
+            builder
+                .add_value_triple(ValueTriple::new_string_value(
+                    &format!("s{:03}", i),
+                    "p",
+                    &format!("o{:03}", i),
+                ))
+                .unwrap();
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        for d in 0..3 {
+            let b = layer.open_write().await.unwrap();
+            b.add_value_triple(ValueTriple::new_string_value(
+                &format!("d{}", d),
+                "p",
+                &format!("v{}", d),
+            ))
+            .unwrap();
+            layer = b.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+        }
+        let head = layer.name();
+
+        let probe = ValueTriple::new_string_value("s025", "p", "o025");
+        let before = store
+            .selective_value_triple_exists(head, &probe)
+            .await
+            .unwrap();
+        assert!(before, "the triple is there before the rollup");
+
+        layer.clone().rollup().await.unwrap();
+
+        // Materialized view after the rollup.
+        let materialized = store.get_layer_from_id(head).await.unwrap().unwrap();
+        let m_id = materialized.value_triple_to_id(&probe);
+        assert!(m_id.is_some(), "materialized still resolves the triple");
+        assert!(materialized.id_triple_exists(m_id.unwrap()));
+
+        // Disk-less view of the same head, which does not follow the rollup.
+        assert!(
+            store
+                .selective_value_triple_exists(head, &probe)
+                .await
+                .unwrap(),
+            "disk-less read must still find the triple after a rollup"
+        );
+        assert_eq!(
+            store
+                .selective_value_triple_to_id(head, &probe)
+                .await
+                .unwrap(),
+            m_id,
+            "disk-less and materialized must agree on the id after a rollup"
+        );
+    }
+
     #[tokio::test]
     async fn create_three_layers_and_squash_all_after_rollup() {
         let store = open_memory_store();

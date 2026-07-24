@@ -336,6 +336,41 @@ The end state is **5.7× faster than the serial walk at the same request count**
 1,663 ms to 292 ms for 24 requests versus 25. The apparent latency/cost tension
 was not inherent; it was a redundant round trip.
 
+### Rollup does nothing for the disk-less path
+
+Read cost scales with chain depth, so rollup — which collapses a chain into one
+layer without discarding the originals — looked like the largest available
+lever. Measured on R2, it is not, because the disk-less path never looks at it.
+
+The rollup itself is cheap: a 12-layer chain rolled up in 569 ms and 5 requests.
+The queries afterwards were unchanged:
+
+| | before rollup | after rollup |
+|---|---|---|
+| selective existence p50 | 273 ms | 240 ms |
+| requests per query | 25 | **25** |
+
+Chain discovery reads the `.stack` manifest, or walks parent pointers, and
+neither consults the rollup pointer. Only the materialized `get_layer` path does.
+So a rolled-up graph is still read as its original twelve layers.
+
+This corrects earlier advice in this document and in the NamiDB comparison, which
+treated rollup as the fix for deep chains. **It is the fix for the materialized
+path only.**
+
+The optimization is available and now known to be safe: ids are preserved across
+rollup, verified by `disk_less_reads_agree_with_materialized_after_rollup`, which
+asserts that a disk-less read of the original chain returns the same id as a
+materialized read through the rollup. So the disk-less read paths could resolve
+`get_rollup(head)` and read the single rolled-up layer instead of the chain,
+taking a maintained graph from 25 requests to roughly 3. It has to be scoped to
+read-only paths — the delta predicates need the real per-layer chain — which is
+why it is not a one-line change.
+
+One caveat the measurement also surfaced: a rolled-up layer contains the whole
+dataset, so it is a much larger object. The first cold query against one showed a
+24.6 s outlier at p95. Fewer, bigger layers is not uniformly cheaper.
+
 ### A measurement error worth recording
 
 The figures of "2 requests per layer" and "24 at depth 12" that appeared in
