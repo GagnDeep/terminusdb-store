@@ -94,6 +94,16 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         Ok(self.get_layer(name).await?.is_some())
     }
 
+    /// The rollup layer registered for `name`, if any.
+    ///
+    /// A rollup collapses `name`'s whole ancestor chain into one base layer
+    /// carrying the same ids, so for read-only queries a rolled-up graph can be
+    /// answered from that single layer. Default `None` — stores that do not
+    /// track rollups simply never take the shortcut.
+    async fn read_rollup(&self, _name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+        Ok(None)
+    }
+
     /// A block source for driving block-lazy dictionaries, if this store's
     /// backend supports ranged structure reads. Default `None` (whole-structure
     /// backends fall back to loading full dictionaries).
@@ -1514,6 +1524,14 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
     /// on the object backend a cached header, no layer load at all.
     async fn layer_exists(&self, name: [u32; 5]) -> io::Result<bool> {
         self.directory_exists(name).await
+    }
+
+    async fn read_rollup(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+        if self.layer_has_rollup(name).await? {
+            Ok(Some(self.read_rollup_file(name).await?))
+        } else {
+            Ok(None)
+        }
     }
 
     #[cfg(feature = "object-store")]

@@ -264,6 +264,10 @@ impl LayerStore for CachedLayerStore {
         self.inner.layer_exists(name).await
     }
 
+    async fn read_rollup(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+        self.inner.read_rollup(name).await
+    }
+
     async fn get_layer_with_cache(
         &self,
         name: [u32; 5],

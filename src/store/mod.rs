@@ -1025,7 +1025,7 @@ impl Store {
     ) -> io::Result<bool> {
         // `retrieve_layer_stack_names` returns the chain base-first; walk it
         // head-first so the newest layer that mentions the triple wins.
-        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let chain = self.read_chain(head).await?;
         // When the backend supports ranged reads, resolve existence via block-
         // lazy adjacency (fetch only the touched `nums` words, not the whole
         // adjacency array); otherwise use the whole-structure primitives.
@@ -1408,7 +1408,7 @@ impl Store {
         // chain is base-first; compute the cumulative node+value and predicate
         // counts *below* each layer (the global-id offset for entries it owns).
         // The per-layer counts are independent, so fetch them all concurrently.
-        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let chain = self.read_chain(head).await?;
         let ls = &self.layer_store;
         let counts = futures::future::try_join_all(chain.iter().map(|&layer| async move {
             let (n, v, p) = futures::try_join!(
@@ -1451,11 +1451,30 @@ impl Store {
     /// offset below each layer, each layer's node count (to split node vs value),
     /// the cumulative predicate offset, and each layer's predicate count. Counts
     /// are fetched concurrently.
+    /// The layers to read to answer a whole-graph query at `head`.
+    ///
+    /// A rollup collapses `head`'s ancestor chain into one base layer with the
+    /// same ids (verified by `disk_less_reads_agree_with_materialized_after_rollup`),
+    /// so a rolled-up graph reads as a single-layer chain — the difference
+    /// between ~2 requests per ancestor and a handful total. On absence, the
+    /// authoritative chain.
+    ///
+    /// Only whole-graph reads (existence, resolution, scan, the counts that
+    /// describe the id space) may use this. The **delta** queries must not: they
+    /// report what an individual layer changed, which a rollup does not preserve,
+    /// so they keep the real per-layer chain via `retrieve_layer_stack_names`.
+    async fn read_chain(&self, head: [u32; 5]) -> io::Result<Vec<[u32; 5]>> {
+        if let Some(rollup) = self.layer_store.read_rollup(head).await? {
+            return Ok(vec![rollup]);
+        }
+        self.layer_store.retrieve_layer_stack_names(head).await
+    }
+
     async fn chain_offsets(
         &self,
         head: [u32; 5],
     ) -> io::Result<(Vec<[u32; 5]>, Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>)> {
-        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let chain = self.read_chain(head).await?;
         let ls = &self.layer_store;
         let counts = futures::future::try_join_all(chain.iter().map(|&layer| async move {
             let (n, v, p) = futures::try_join!(
@@ -1769,7 +1788,7 @@ impl Store {
         &self,
         head: [u32; 5],
     ) -> io::Result<crate::layer::InternalTripleSubjectIterator> {
-        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let chain = self.read_chain(head).await?;
         let ls = &self.layer_store;
         // Fetch every layer's addition and removal iterators concurrently,
         // head-first (index 0 = most recent, as the reconciliation requires).
@@ -1850,7 +1869,7 @@ impl Store {
         head: [u32; 5],
         subject: u64,
     ) -> io::Result<Vec<IdTriple>> {
-        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let chain = self.read_chain(head).await?;
         let mut per_layer = Vec::with_capacity(chain.len());
         for &layer in chain.iter().rev() {
             let adds = self.layer_store.triple_additions_s(layer, subject).await?;
@@ -1867,7 +1886,7 @@ impl Store {
         subject: u64,
         predicate: u64,
     ) -> io::Result<Vec<IdTriple>> {
-        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let chain = self.read_chain(head).await?;
         let mut per_layer = Vec::with_capacity(chain.len());
         for &layer in chain.iter().rev() {
             let adds = self
@@ -1889,7 +1908,7 @@ impl Store {
         head: [u32; 5],
         predicate: u64,
     ) -> io::Result<Vec<IdTriple>> {
-        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let chain = self.read_chain(head).await?;
         let mut per_layer = Vec::with_capacity(chain.len());
         for &layer in chain.iter().rev() {
             let adds = self
@@ -1913,7 +1932,7 @@ impl Store {
         head: [u32; 5],
         object: u64,
     ) -> io::Result<Vec<IdTriple>> {
-        let chain = self.layer_store.retrieve_layer_stack_names(head).await?;
+        let chain = self.read_chain(head).await?;
         let mut per_layer = Vec::with_capacity(chain.len());
         for &layer in chain.iter().rev() {
             let adds: Vec<IdTriple> = self
@@ -2191,7 +2210,8 @@ impl LazyLayer {
     /// Cumulative (nodes, values, predicates) over the whole ancestor chain.
     /// The per-layer counts are fetched concurrently.
     async fn chain_count_totals(&self) -> io::Result<(u64, u64, u64)> {
-        let chain = self.retrieve_layer_stack_names().await?;
+        // The id-space size is identical read through a rollup, and cheaper.
+        let chain = self.store.read_chain(self.head).await?;
         let ls = &self.store.layer_store;
         let per_layer = futures::future::try_join_all(chain.into_iter().map(|layer| async move {
             let (n, v, p) = futures::try_join!(
@@ -2264,7 +2284,10 @@ impl LazyLayer {
     }
 
     async fn chain_triple_counts(&self) -> io::Result<(usize, usize)> {
-        let chain = self.retrieve_layer_stack_names().await?;
+        // Through a rollup this is one base layer: all triples as additions,
+        // none as removals, so additions - removals is the same net count as
+        // reconciling the real chain, and far cheaper.
+        let chain = self.store.read_chain(self.head).await?;
         let ls = &self.store.layer_store;
         let per_layer = futures::future::try_join_all(chain.into_iter().map(|layer| async move {
             futures::try_join!(
@@ -3768,7 +3791,7 @@ mod tests {
         assert!(m_id.is_some(), "materialized still resolves the triple");
         assert!(materialized.id_triple_exists(m_id.unwrap()));
 
-        // Disk-less view of the same head, which does not follow the rollup.
+        // Disk-less view of the same head, which now follows the rollup.
         assert!(
             store
                 .selective_value_triple_exists(head, &probe)
@@ -3783,6 +3806,66 @@ mod tests {
                 .unwrap(),
             m_id,
             "disk-less and materialized must agree on the id after a rollup"
+        );
+
+        // The whole disk-less surface must match the materialized layer, since
+        // it now reads the rollup rather than the original chain.
+        let lazy = store.lazy_layer(head);
+        assert_eq!(
+            lazy.node_and_value_count().await.unwrap(),
+            materialized.node_and_value_count() as u64
+        );
+        assert_eq!(
+            lazy.predicate_count().await.unwrap(),
+            materialized.predicate_count() as u64
+        );
+        assert_eq!(
+            lazy.triple_count().await.unwrap(),
+            materialized.triple_count()
+        );
+
+        let mut m_all: Vec<IdTriple> = materialized.triples().collect();
+        let mut l_all: Vec<IdTriple> = lazy.triples().await.unwrap().collect();
+        m_all.sort();
+        l_all.sort();
+        assert_eq!(l_all, m_all, "full scan must match after rollup");
+        assert!(!l_all.is_empty());
+
+        for t in m_all.iter().take(10) {
+            assert_eq!(
+                lazy.id_subject(t.subject).await.unwrap(),
+                materialized.id_subject(t.subject)
+            );
+            assert_eq!(
+                lazy.id_predicate(t.predicate).await.unwrap(),
+                materialized.id_predicate(t.predicate)
+            );
+            assert_eq!(
+                lazy.id_object(t.object).await.unwrap(),
+                materialized.id_object(t.object)
+            );
+            assert!(lazy
+                .triple_exists(t.subject, t.predicate, t.object)
+                .await
+                .unwrap());
+        }
+
+        let (s, p, o) = (m_all[0].subject, m_all[0].predicate, m_all[0].object);
+        let sorted = |mut v: Vec<IdTriple>| {
+            v.sort();
+            v
+        };
+        assert_eq!(
+            sorted(lazy.triples_s(s).await.unwrap()),
+            sorted(materialized.triples_s(s).collect())
+        );
+        assert_eq!(
+            sorted(lazy.triples_p(p).await.unwrap()),
+            sorted(materialized.triples_p(p).collect())
+        );
+        assert_eq!(
+            sorted(lazy.triples_o(o).await.unwrap()),
+            sorted(materialized.triples_o(o).collect())
         );
     }
 

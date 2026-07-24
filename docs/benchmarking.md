@@ -336,11 +336,13 @@ The end state is **5.7× faster than the serial walk at the same request count**
 1,663 ms to 292 ms for 24 requests versus 25. The apparent latency/cost tension
 was not inherent; it was a redundant round trip.
 
-### Rollup does nothing for the disk-less path
+### Rollup: from inert to a 25 → 3 request win
 
 Read cost scales with chain depth, so rollup — which collapses a chain into one
-layer without discarding the originals — looked like the largest available
-lever. Measured on R2, it is not, because the disk-less path never looks at it.
+layer without discarding the originals — is the largest available lever. It was
+initially inert on the disk-less path, which read the original chain and never
+consulted the rollup pointer; wiring that in (below) turned it into the biggest
+single win.
 
 The rollup itself is cheap: a 12-layer chain rolled up in 569 ms and 5 requests.
 The queries afterwards were unchanged:
@@ -354,22 +356,39 @@ Chain discovery reads the `.stack` manifest, or walks parent pointers, and
 neither consults the rollup pointer. Only the materialized `get_layer` path does.
 So a rolled-up graph is still read as its original twelve layers.
 
-This corrects earlier advice in this document and in the NamiDB comparison, which
-treated rollup as the fix for deep chains. **It is the fix for the materialized
-path only.**
+Until the read paths were wired to the rollup pointer, this was true of the
+materialized path only; it now holds for disk-less reads too.
 
-The optimization is available and now known to be safe: ids are preserved across
-rollup, verified by `disk_less_reads_agree_with_materialized_after_rollup`, which
-asserts that a disk-less read of the original chain returns the same id as a
-materialized read through the rollup. So the disk-less read paths could resolve
-`get_rollup(head)` and read the single rolled-up layer instead of the chain,
-taking a maintained graph from 25 requests to roughly 3. It has to be scoped to
-read-only paths — the delta predicates need the real per-layer chain — which is
-why it is not a one-line change.
+**This is now implemented.** The disk-less read paths resolve the rollup
+pointer and read the single rolled-up layer instead of walking the original
+chain. Measured on R2, the same queries that cost 25 requests before rollup cost
+**3** after:
 
-One caveat the measurement also surfaced: a rolled-up layer contains the whole
-dataset, so it is a much larger object. The first cold query against one showed a
-24.6 s outlier at p95. Fewer, bigger layers is not uniformly cheaper.
+| | before rollup | after rollup (chain) | after rollup (reads it) |
+|---|---|---|---|
+| selective existence p50 | 273 ms | 240 ms | **208 ms** |
+| requests per query | 25 | 25 | **3** |
+| throughput under load | 143 q/s | 139 q/s | **204 q/s** |
+| store req/s under load | 100 | 97 | **31** |
+
+Three requests for a maintained graph of any depth, versus roughly 2 per
+ancestor without rollup. The rollup itself is a background operation (730 ms, 5
+requests here) that runs off the write path.
+
+Safety rests on ids being preserved across rollup, so a disk-less read of the
+rolled-up layer returns exactly what a materialized read through the rollup
+does. `disk_less_reads_agree_with_materialized_after_rollup` pins this across the
+whole surface — counts, full scan, forward and reverse resolution, and traversal
+by subject/predicate/object all match the materialized layer. The shortcut is
+scoped to whole-graph reads: the **delta** predicates keep the real per-layer
+chain, since a rollup does not preserve what an individual layer changed.
+
+One caveat: a rolled-up layer contains the whole dataset, so it is a much larger
+object. A cold query fetches more of it in each of those 3 requests (the bytes
+above are similar only because this benchmark's layers are small), and a very
+large rolled-up layer will have a heavier cold read even as its request count
+falls. Fewer, bigger objects trades request count for object size — the right
+trade against a per-request-billed store, but not a free one.
 
 ### A measurement error worth recording
 
