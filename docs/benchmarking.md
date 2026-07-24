@@ -139,12 +139,12 @@ prefixes as it touches layers. Measured on the 12-layer chain
 | | requests | prefixes touched | busiest prefix | implied ceiling |
 |---|---|---|---|---|
 | coalescing off | 369 | 12 | 39 | ~141 queries/s |
-| coalescing on | 87 | 12 | 10 | **~550 queries/s** |
+| coalescing on | 24 | 12 | 2 | **~2,750 queries/s** |
 
 So the ceiling is set by the *busiest* prefix, not the query total: roughly
-**550 disk-less queries per second** on one graph with coalescing on, about 4×
-better than without it, and an order of magnitude better than the naive
-whole-query division suggested.
+**2,750 disk-less queries per second** on one graph with coalescing on, about
+20× better than without it, and far better than the naive whole-query division
+suggested.
 
 Two caveats. Every query on a given graph hits that same set of layer prefixes,
 so this is a per-graph ceiling; unrelated graphs use different layers and
@@ -160,21 +160,44 @@ costing 11–13 requests, one per layer, each tiny — `NegSPAdjacencyListBits` 
 11 requests for **88 bytes total**, eight bytes per request. Those are control
 words and index headers.
 
-So the fix is to fetch each layer's small structures together. Measured on MinIO
-at concurrency 4, toggled with `TDB_COALESCE_MAX_STRUCTURE_BYTES`:
+So the fix is to fetch each layer's small structures together. Note the backend
+has **three** read paths — `get_layer_structure_bytes`,
+`get_layer_structure_range` and `read_layer_structure_bytes_from` — and the
+third carries the logarray control-word reads: eight bytes at the end of a
+structure, three per layer per query. Wiring only the first two left most of the
+benefit unclaimed. Routing all three through the region cache is what took a
+12-layer query from 87 requests to **24**, and a single layer to **2** (a header
+probe plus one span).
+
+Measured on MinIO at concurrency 4, toggled with
+`TDB_COALESCE_MAX_STRUCTURE_BYTES`:
 
 | | coalescing off | coalescing on | |
 |---|---|---|---|
-| selective existence p50 | 53.1 ms | **23.5 ms** | 2.3× faster |
-| requests per query | 350 | **87** | 4.0× fewer |
-| bytes per query | 11.1 KiB | 36.7 KiB | 3.3× **more** |
-| throughput under load | 65 q/s | **342 q/s** | 5.3× |
-| query p50 under load | 61.0 ms | **11.2 ms** | 5.5× lower |
-| object-store req/s | 19,459 | **9,382** | half the pressure |
+| selective existence p50 | 53.1 ms | **11.0 ms** | 4.8× faster |
+| requests per query (cold) | 350 | **24** | 15× fewer |
+| bytes per query | 11.1 KiB | 35.6 KiB | 3.2× **more** |
+| throughput under load | 65 q/s | **2,076 q/s** | 32× |
+| query p50 under load | 61.0 ms | **1.8 ms** | 34× lower |
+| object-store req/s | 19,459 | **125** | 156× less pressure |
 
-The last two rows together are the point: **5.3× the throughput at half the
-request rate**. On the per-prefix measurement above, the ceiling moves from ~141 to **~550
-disk-less queries per second**.
+The last row is the striking one. At 2,076 queries/s the store sees 125
+requests/s — about **0.06 requests per query in steady state**. Layers are
+immutable, so a cached span is valid forever and warm queries barely touch the
+network at all. The 24 is the *cold* cost.
+
+Requests scale with chain depth at roughly **2 per layer**:
+
+| chain depth | requests (cold) |
+|---|---|
+| 1 (rolled up) | **2** |
+| 2 | 4 |
+| 4 | 8 |
+| 12 | 24 |
+
+Two requests for a rolled-up graph is fewer round trips than a columnar store
+typically needs for a single row group, so on this axis the disk-less path is no
+longer behind.
 
 **This is a trade, not a free win.** Coalescing fetches whole small structures
 where the uncoalesced path took only the bytes it needed, so byte transfer rises
