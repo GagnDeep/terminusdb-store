@@ -42,3 +42,12 @@ pub use store::sync::{open_sync_archive_store, open_sync_directory_store, open_s
 pub use store::{open_archive_store, open_directory_store, open_memory_store};
 #[cfg(feature = "object-store")]
 pub use store::{open_object_store, open_object_store_with_cache};
+
+/// The `object_store` crate this build links against.
+///
+/// Re-exported so downstreams can build the `Arc<dyn ObjectStore>` that
+/// [`open_object_store`] takes without declaring their own dependency on it: a
+/// version that resolved differently would be a *distinct* `ObjectStore` trait,
+/// and the handle would not unify.
+#[cfg(feature = "object-store")]
+pub use object_store;
