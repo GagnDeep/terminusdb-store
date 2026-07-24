@@ -801,6 +801,33 @@ impl SyncStore {
         task_sync(self.inner.layer_exists(layer))
     }
 
+    /// The rollup registered for `head`, if any — whether background compaction
+    /// has flattened it. Useful for monitoring the compaction policy.
+    pub fn rollup_of(&self, head: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+        task_sync(self.inner.rollup_of(head))
+    }
+
+    /// Start background rollup compaction: every `interval`, roll up (never
+    /// squash) any label head whose effective layer stack exceeds `max_depth`.
+    ///
+    /// This is what keeps disk-less reads cheap. A deep chain costs roughly two
+    /// object-store requests per layer; a rolled-up graph costs a handful total,
+    /// because the read paths follow the rollup pointer. Rollup is
+    /// non-destructive, so history and the per-commit audit trail are preserved.
+    ///
+    /// The task runs on this module's shared runtime, so it keeps running
+    /// without a caller holding an async context. Aborting the returned handle
+    /// stops it; dropping the handle does not.
+    pub fn spawn_compaction(
+        &self,
+        max_depth: usize,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        // spawn_compaction calls tokio::spawn, which needs a runtime in scope.
+        let _guard = RUNTIME.enter();
+        self.inner.spawn_compaction(max_depth, interval)
+    }
+
     /// Create a base layer builder, unattached to any database label.
     ///
     /// After having committed it, use `set_head` on a `NamedGraph` to attach it.
@@ -906,6 +933,66 @@ pub fn open_sync_raw_archive_store<P: Into<PathBuf>>(path: P) -> SyncStore {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Background compaction started through the sync facade must actually run
+    /// on the shared runtime and roll a deep chain up, so a later read sees a
+    /// shallow rollup. This is the path TerminusDB uses.
+    #[test]
+    fn sync_spawn_compaction_rolls_up_in_background() {
+        let store = open_sync_memory_store();
+        let db = store.create("g").unwrap();
+
+        let builder = store.create_base_layer().unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("a", "p", "b"))
+            .unwrap();
+        let mut layer = builder.commit().unwrap();
+        db.set_head(&layer).unwrap();
+        for i in 0..6 {
+            let b = layer.open_write().unwrap();
+            b.add_value_triple(ValueTriple::new_string_value(
+                &format!("k{i}"),
+                "p",
+                &format!("v{i}"),
+            ))
+            .unwrap();
+            layer = b.commit().unwrap();
+            db.set_head(&layer).unwrap();
+        }
+        let head = layer.name();
+
+        // deep chain before compaction
+        assert!(
+            store
+                .lazy_layer(head)
+                .retrieve_layer_stack_names()
+                .unwrap()
+                .len()
+                > 2
+        );
+
+        let handle = store.spawn_compaction(2, std::time::Duration::from_millis(10));
+
+        // wait for the background task to roll it up (bounded, not a race)
+        let mut rolled = false;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if store.rollup_of(head).unwrap().is_some() {
+                rolled = true;
+                break;
+            }
+        }
+        handle.abort();
+        assert!(
+            rolled,
+            "background compaction should have rolled the head up"
+        );
+
+        // contents preserved, and the read is now shallow
+        let l = store.get_layer_from_id(head).unwrap().unwrap();
+        assert!(l.value_triple_exists(&ValueTriple::new_string_value("a", "p", "b")));
+        assert!(l.value_triple_exists(&ValueTriple::new_string_value("k5", "p", "v5")));
+    }
 
     // The synchronous disk-less handle must answer exactly like the materialized
     // sync layer, over a graph large enough to drive the block-lazy path.

@@ -1822,6 +1822,13 @@ impl Store {
         }
     }
 
+    /// The rollup registered for `head`, if any — i.e. whether background
+    /// compaction has flattened this head. `None` means it has not been rolled
+    /// up. Useful for monitoring a compaction policy.
+    pub async fn rollup_of(&self, head: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+        self.layer_store.read_rollup(head).await
+    }
+
     /// Whether a layer exists, without materializing it. Pairs with
     /// [`lazy_layer`](Self::lazy_layer), which hands out a handle for any name
     /// and so cannot itself report that the layer is unknown.
