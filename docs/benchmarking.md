@@ -91,6 +91,63 @@ cargo run --release --example bench_object_store --features object-store
 > Credentials never go through this repo. Set them in your own shell/CI secret and
 > run the harness yourself; the harness only reads standard `object_store` env vars.
 
+## Measured: MinIO tier
+
+Run on 2026-07-24 against MinIO on loopback (`--address 127.0.0.1:9377`), a
+12-layer chain over a 2,000-triple base. This is a real S3 API over real HTTP
+with real conditional PUT — but ~0.5 ms RTT, so treat wall-clock as a lower
+bound and request counts as the transferable number.
+
+| query class | wall-clock p50 | requests | bytes |
+|---|---|---|---|
+| cold whole-layer read | 223.6 ms | 522 | 35.6 KiB |
+| selective existence, present | 52.7 ms | 350 | 11.1 KiB |
+| selective existence, absent | 51.9 ms | 350 | 11.1 KiB |
+| full scan (disk-less) | 19.9 ms | 229 | 11.8 KiB |
+
+Buffered writes: 0.91 ms p50 per commit; a 20-commit flush takes 19.6 ms in 33
+requests (one layer object, one label CAS, one WAL checkpoint).
+
+### The throttling result
+
+Concurrency sweep, 400 queries per run:
+
+| in flight | queries/s | object-store req/s | query p50 |
+|---|---|---|---|
+| 1 | 22 | 6,660 | 44.9 ms |
+| 4 | 60 | 18,188 | 63.6 ms |
+| 16 | 60 | 18,080 | 264.9 ms |
+| 64 | 67 | 20,352 | 911.4 ms |
+
+Throughput saturates around 60 queries/s past concurrency 4 while latency grows
+linearly — that ceiling is MinIO's, single-node on loopback, not S3's.
+
+**The number that transfers is requests per query: ~350** for a selective
+existence check on a 12-layer chain. That is a property of this code, not of the
+backend. Against S3's documented ~5,500 GET/s per prefix:
+
+> **~5,500 ÷ 350 ≈ 15 disk-less queries per second per prefix** before AWS
+> starts returning 503 SlowDown.
+
+Even a *single-threaded* query stream measured 6,660 requests/s here, already
+above the per-prefix cap. This confirms, with measurements rather than
+arithmetic, the risk flagged in the object-store RFC: the disk-less path trades
+bytes for request count, and request count is what S3 rate-limits.
+
+Two mitigations, neither yet implemented:
+
+- **Request coalescing** — merge adjacent block fetches within a query. The
+  request count is dominated by many small ranged GETs into the same few
+  structures, so this is where the headroom is.
+- **Prefix sharding** — S3's limit is per prefix, so distributing layer objects
+  across N prefixes multiplies the ceiling by roughly N. Cheap, and independent
+  of the above.
+
+The materialized path pays 522 requests once and then serves from cache; the
+disk-less path pays ~350 per query. That is the real trade, and it argues for
+disk-less on large-working-set / low-QPS workloads rather than as a blanket
+default.
+
 ## Knobs
 
 | Env var | Default | Meaning |
