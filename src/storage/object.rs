@@ -1244,8 +1244,143 @@ mod tests {
     // individual layer structures, to see where the residual (~a third of a full
     // read) goes and whether block-lazy adjacency (Stage 3) is worth it.
     // Run with: cargo test --features object-store profile_selective -- --ignored --nocapture
-    #[tokio::test]
+    /// Where do the *requests* go?
+    ///
+    /// The MinIO benchmark showed a selective existence check on a 12-layer
+    /// chain costs ~350 object-store requests, and that request count -- not
+    /// bytes -- is what S3 rate-limits. This attributes each request to the
+    /// structure it read, so the coalescing work has a target instead of a
+    /// guess.
+    ///
+    /// Run with: cargo test --features object-store -- --ignored --nocapture
+    ///           profile_selective_request_breakdown
     #[ignore]
+    #[tokio::test]
+    async fn profile_selective_request_breakdown() {
+        use crate::storage::archive::ArchiveHeader;
+        use crate::storage::consts::LayerFileEnum;
+        use num_traits::FromPrimitive;
+
+        const DEPTH: usize = 12;
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (head, chain) = {
+            let store = crate::store::open_object_store(bucket.clone(), "", 1 << 30);
+            let db = store.create("g").await.unwrap();
+            let builder = store.create_base_layer().await.unwrap();
+            for i in 0..2000 {
+                builder
+                    .add_value_triple(ValueTriple::new_string_value(
+                        &format!("s{:05}", i),
+                        "p",
+                        &format!("o{:05}", i),
+                    ))
+                    .unwrap();
+            }
+            let mut layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+            for d in 1..DEPTH {
+                let b = layer.open_write().await.unwrap();
+                for i in 0..20 {
+                    b.add_value_triple(ValueTriple::new_string_value(
+                        &format!("d{}s{:05}", d, i),
+                        "p",
+                        &format!("d{}o{:05}", d, i),
+                    ))
+                    .unwrap();
+                }
+                layer = b.commit().await.unwrap();
+                db.set_head(&layer).await.unwrap();
+            }
+            let head = layer.name();
+            let chain: Vec<[u32; 5]> = store
+                .lazy_layer(head)
+                .retrieve_layer_stack_names()
+                .await
+                .unwrap();
+            (head, chain)
+        };
+
+        let target = ValueTriple::new_string_value("s01000", "p", "o01000");
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = crate::store::open_object_store(
+            Arc::new(ProfilingStore {
+                inner: bucket.clone(),
+                ranges: ranges.clone(),
+            }),
+            "",
+            0,
+        );
+        assert!(store
+            .selective_value_triple_exists(head, &target)
+            .await
+            .unwrap());
+
+        // Map every layer object's byte spans to structure names.
+        let mut spans: Vec<(String, usize, usize, String)> = Vec::new();
+        for &layer in chain.iter() {
+            let s = crate::storage::name_to_string(layer);
+            let key = format!("{}/{}.larch", &s[0..3], s);
+            let bytes = bucket
+                .get(&ObjectPath::from(key.clone()))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let full_len = bytes.len();
+            let (header, remainder) = ArchiveHeader::parse(bytes);
+            let data_start = full_len - remainder.len();
+            for i in 0..64u64 {
+                if let Some(f) = LayerFileEnum::from_u64(i) {
+                    if let Some(r) = header.range_for(f) {
+                        spans.push((
+                            key.clone(),
+                            data_start + r.start,
+                            data_start + r.end,
+                            format!("{:?}", f),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut by_structure: std::collections::BTreeMap<String, (usize, usize)> =
+            std::collections::BTreeMap::new();
+        let mut total_requests = 0usize;
+        let mut total_bytes = 0usize;
+        for (k, start, end) in ranges.lock().unwrap().iter() {
+            total_requests += 1;
+            total_bytes += end - start;
+            let label = if *start == 0 && *end <= 1024 {
+                "<header probe>".to_string()
+            } else {
+                let mid = start + (end - start) / 2;
+                spans
+                    .iter()
+                    .find(|(sk, s0, s1, _)| sk == k && mid >= *s0 && mid < *s1)
+                    .map(|(_, _, _, name)| name.clone())
+                    .unwrap_or_else(|| "<other object>".to_string())
+            };
+            let e = by_structure.entry(label).or_default();
+            e.0 += 1;
+            e.1 += end - start;
+        }
+
+        let mut rows: Vec<_> = by_structure.into_iter().collect();
+        rows.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+        println!(
+            "\nselective existence over {} layers: {} requests, {} bytes",
+            DEPTH, total_requests, total_bytes
+        );
+        println!("{:<45} {:>8} {:>10}", "structure", "requests", "bytes");
+        for (name, (n, b)) in &rows {
+            println!("{:<45} {:>8} {:>10}", name, n, b);
+        }
+        println!("{:<45} {:>8} {:>10}", "TOTAL", total_requests, total_bytes);
+    }
+
+    #[ignore]
+    #[tokio::test]
     async fn profile_selective_value_exists_byte_breakdown() {
         use crate::storage::archive::ArchiveHeader;
         use crate::storage::consts::LayerFileEnum;
