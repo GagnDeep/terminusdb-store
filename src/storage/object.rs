@@ -564,18 +564,24 @@ impl ArchiveMetadataBackend for ObjectArchiveBackend {
     }
 
     async fn layer_exists(&self, id: [u32; 5]) -> io::Result<bool> {
-        // A cached header proves existence; layers are immutable, so once a layer
-        // is known to exist it exists forever. This elides the repeated HEAD that
-        // `directory_exists` triggers all over the read path. (Only positive
-        // results are cached: a not-yet-finalized layer may appear later.)
+        // A cached header proves existence; layers are immutable, so once a
+        // layer is known to exist it exists forever.
         if self.header_cache.lock().await.contains(&id) {
             return Ok(true);
         }
-        let path = self.layer_key(id);
-        match self.store.head(&path).await {
+        // Otherwise prove it by fetching the header rather than by a separate
+        // HEAD. Every caller that asks whether a layer exists goes on to read
+        // it, so the HEAD was pure overhead -- an extra round trip, and on a
+        // per-operation-billed store an extra charge, for information the
+        // following GET establishes anyway. The header is cached and
+        // single-flighted, so concurrent probes of the same layer collapse.
+        //
+        // Negative results are deliberately not cached: a layer that is not yet
+        // finalized may appear later.
+        match self.layer_header(id).await {
             Ok(_) => Ok(true),
-            Err(OsError::NotFound { .. }) => Ok(false),
-            Err(e) => Err(os_err_to_io(e)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
         }
     }
 

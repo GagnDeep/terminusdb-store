@@ -315,19 +315,26 @@ and was already being written — but it was only used to warm caches, never for
 discovery, so the walk still happened. Wiring it into discovery (as a validated
 hint, with the authoritative walk as fallback) and probing layers concurrently:
 
-| | before | after |
-|---|---|---|
-| selective existence p50 | 1,663 ms | **407 ms** |
-| requests per query | 24 | 97 (25 get, 72 head) |
+| | serial walk | + manifest | + no existence HEADs |
+|---|---|---|---|
+| selective existence p50 | 1,663 ms | 407 ms | **292 ms** |
+| requests per query | 24 | 97 (25 get, 72 head) | **25 (all get)** |
+| throughput under load | — | 105 q/s | **143 q/s** |
+| query p50 under load | — | 2.69 ms | **1.70 ms** |
+| object-store req/s under load | — | 817 | **100** |
 
-**4.1× faster, at 4× the requests.** The extra requests are existence/size
-probes: the old code walked the chain and stopped at the first layer holding the
-string, while the new one probes every layer at once. That is the right trade
-when latency dominates and the wrong one when per-request billing does — R2
-bills per operation, so this is a genuine tension, not a clean win.
+The manifest bought 4.1× at 4× the requests — the old path stopped at the first
+layer holding the string, the new one probes all of them, and those probes were
+mostly `layer_exists` HEADs.
 
-Under load with warm caches the picture is much better: 105 queries/s at 2.69 ms
-p50, since immutable layers mean cached spans stay valid.
+Those HEADs turned out to be pure overhead. Every caller that asks whether a
+layer exists goes on to read it, and the header GET that follows establishes
+existence by itself; `layer_exists` now proves it by fetching the header (cached
+and single-flighted) instead of by a separate HEAD. That removed all 72.
+
+The end state is **5.7× faster than the serial walk at the same request count** —
+1,663 ms to 292 ms for 24 requests versus 25. The apparent latency/cost tension
+was not inherent; it was a redundant round trip.
 
 ### A measurement error worth recording
 
@@ -336,7 +343,7 @@ earlier revisions of this document came from `profile_selective_request_breakdow
 which was recording only **ranged** GETs. Manifest, rollup-pointer and label
 reads are unranged and were invisible to it. Corrected, the same query costs
 5 / 9 / 17 / 49 requests at depth 1 / 2 / 4 / 12 — roughly double what was
-reported. The benchmark harness always counted every request, so its numbers
+reported. (After removing the existence HEADs these are 3 / — / — / 25.) The benchmark harness always counted every request, so its numbers
 were right; only the profiler's were not.
 
 ## Knobs
