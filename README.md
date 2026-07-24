@@ -60,6 +60,77 @@ For more information, [visit the documentation on docs.rs](https://docs.rs/termi
 
 See also the `examples/` directory for some basic examples.
 
+## Object-storage backend (optional)
+
+An optional S3-compatible object-storage backend keeps a store inside a bucket
+instead of a local directory: the bucket is the source of truth and compute is
+stateless (durability, cheap storage, stateless replicas, trivial backup). It is
+built on the Apache Arrow [`object_store`](https://crates.io/crates/object_store)
+crate, so the same code works against S3, GCS, Azure, Cloudflare R2, MinIO, a
+local filesystem, or an in-memory store.
+
+It does **not** make the database larger than RAM — the working set is still
+fully loaded and expanded in memory on read. The wins are operational.
+
+Enable the default-off feature:
+
+```toml
+[dependencies]
+terminus-store = { version = "0.21", features = ["object-store"] }
+object_store = { version = "0.11", features = ["aws"] }
+```
+
+Open a store over any `object_store::ObjectStore`:
+
+```rust
+use std::sync::Arc;
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+
+// S3 / R2 / MinIO. `with_conditional_put(ETagMatch)` enables the label
+// compare-and-swap; `with_endpoint` + `with_allow_http` target MinIO/R2.
+let s3 = AmazonS3Builder::new()
+    .with_endpoint("http://localhost:9100")     // omit for real AWS S3
+    .with_bucket_name("terminusdb")
+    .with_access_key_id("minioadmin")
+    .with_secret_access_key("minioadmin")
+    .with_region("us-east-1")
+    .with_allow_http(true)                       // MinIO over http; drop for https
+    .with_conditional_put(S3ConditionalPut::ETagMatch)
+    .build()
+    .unwrap();
+
+// prefix keys under "graphs/", 100 MiB in-memory layer cache
+let store = terminus_store::open_object_store(Arc::new(s3), "graphs", 100);
+
+// or add a local-disk spill cache tier between RAM and the network:
+let (store, disk_stats) = terminus_store::open_object_store_with_cache(
+    Arc::new(s3), "graphs", 100, "/var/cache/terminusdb".into());
+```
+
+For a network-free store (tests, caching), point it at
+`object_store::memory::InMemory` or `object_store::local::LocalFileSystem`. Note
+that `LocalFileSystem` does not support conditional PUT, so label
+compare-and-swap requires a store that does (S3/GCS/Azure/R2/MinIO/InMemory).
+
+**Layout & config.** One layer is one immutable object at
+`<prefix>/<first-3-hex>/<hash>.larch`; labels are compare-and-swap objects at
+`<prefix>/<name>.label`. Credentials and the endpoint override for R2/MinIO are
+passed through `object_store`'s builders (`AmazonS3Builder`, `GoogleCloudStorageBuilder`,
+`MicrosoftAzureBuilder`) or its env vars (`AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ALLOW_HTTP`).
+
+**Performance & scale.** The backend is tuned for low S3 latency and RAM:
+layers are read with a parallel-prefetch stack manifest (deep-chain cold reads
+drop ~13× vs. a sequential walk), archives are memory-mapped for larger-than-RAM
+reads over a local-NVMe/RAM buffer pool, `Store::spawn_compaction` bounds read
+depth via non-destructive rollup, and `store::buffered::BufferedNamedGraph` adds
+opt-in group commit (many commits → one object) with an optional per-commit
+write-ahead log. See [`docs/object-store-optimizations.md`](docs/object-store-optimizations.md).
+
+**Integration tests.** `docker-compose.minio.yml` brings up MinIO for the
+`#[ignore]`d integration tests; see the design notes in
+[`docs/RFC-object-store.md`](docs/RFC-object-store.md).
+
 ## Upgrading from 0.19 or earlier
 Starting with version 0.20.0, terminus-store uses a new storage format, which bundles all files into a single archive, and also supports value types. Stores created using 0.19 or earlier will not work with 0.20 or later. However, there is a conversion tool to convert existing pre-v20 stores: [terminusdb-10-to-11](https://github.com/terminusdb/terminusdb-10-to-11/).
 

@@ -85,6 +85,33 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         Ok(())
     }
 
+    /// Whether a layer with this name exists, without materializing it.
+    ///
+    /// The default has to load the layer to find out, which is exactly what a
+    /// disk-less caller is trying to avoid; backends with a cheap existence
+    /// probe (a HEAD, or a cached archive header) should override it.
+    async fn layer_exists(&self, name: [u32; 5]) -> io::Result<bool> {
+        Ok(self.get_layer(name).await?.is_some())
+    }
+
+    /// The rollup layer registered for `name`, if any.
+    ///
+    /// A rollup collapses `name`'s whole ancestor chain into one base layer
+    /// carrying the same ids, so for read-only queries a rolled-up graph can be
+    /// answered from that single layer. Default `None` — stores that do not
+    /// track rollups simply never take the shortcut.
+    async fn read_rollup(&self, _name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+        Ok(None)
+    }
+
+    /// A block source for driving block-lazy dictionaries, if this store's
+    /// backend supports ranged structure reads. Default `None` (whole-structure
+    /// backends fall back to loading full dictionaries).
+    #[cfg(feature = "object-store")]
+    fn block_source(&self) -> Option<std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>> {
+        None
+    }
+
     async fn get_layer_parent_name(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>>;
 
     async fn get_node_dictionary(&self, name: [u32; 5]) -> io::Result<Option<StringDict>>;
@@ -385,10 +412,51 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
     }
 
     async fn directory_exists(&self, name: [u32; 5]) -> io::Result<bool>;
+
+    /// The ancestor chain, oldest-first, if the backend can produce it without
+    /// walking parent pointers.
+    ///
+    /// The default discovery walk reads one layer's parent pointer to learn the
+    /// next, so it costs a round trip per ancestor and they cannot overlap. That
+    /// is invisible against a local store and dominates everything against a
+    /// real object store -- a 12-layer chain measured 1.5 s on R2, almost all of
+    /// it this walk. A backend that persists a manifest can return the whole
+    /// chain in one request.
+    ///
+    /// Hint only: `None` falls back to the authoritative walk, so a missing,
+    /// stale or corrupt manifest costs latency and never correctness.
+    async fn stack_names_hint(&self, _name: [u32; 5]) -> io::Result<Option<Vec<[u32; 5]>>> {
+        Ok(None)
+    }
+
     async fn get_file(&self, directory: [u32; 5], name: &str) -> io::Result<Self::File>;
     async fn file_exists(&self, directory: [u32; 5], file: &str) -> io::Result<bool>;
 
     async fn finalize(&self, _directory: [u32; 5]) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// A block source for driving block-lazy dictionaries. Default `None`;
+    /// overridden by `ArchiveLayerStore` to hand out its ranged-read backends.
+    #[cfg(feature = "object-store")]
+    fn block_source(&self) -> Option<std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>> {
+        None
+    }
+
+    /// Prefetch the given layer archives concurrently into whatever cache the
+    /// store has, so a subsequent sequential build reads from a warm cache
+    /// instead of issuing one blocking round trip per layer.
+    ///
+    /// Best-effort: implementations should swallow per-layer errors (the
+    /// authoritative load happens afterwards regardless). The default is a
+    /// no-op, so stores without a cache (directory, memory) are unaffected.
+    async fn prefetch_layers(&self, _names: &[[u32; 5]]) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Warm the entire ancestor chain of `name` into cache ahead of a read,
+    /// using a persisted stack manifest if the store has one. Default no-op.
+    async fn warm_layer_stack(&self, _name: [u32; 5]) -> io::Result<()> {
         Ok(())
     }
 
@@ -1452,6 +1520,25 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         self.directories().await
     }
 
+    /// A persistent store can answer this from its directory/archive index --
+    /// on the object backend a cached header, no layer load at all.
+    async fn layer_exists(&self, name: [u32; 5]) -> io::Result<bool> {
+        self.directory_exists(name).await
+    }
+
+    async fn read_rollup(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+        if self.layer_has_rollup(name).await? {
+            Ok(Some(self.read_rollup_file(name).await?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[cfg(feature = "object-store")]
+    fn block_source(&self) -> Option<std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>> {
+        PersistentLayerStore::block_source(self)
+    }
+
     async fn get_layer_with_cache(
         &self,
         name: [u32; 5],
@@ -1467,6 +1554,11 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
         if !self.directory_exists(name).await? {
             return Ok(None);
         }
+
+        // If the store has a stack manifest, warm the whole ancestor chain's
+        // archives in parallel now, so the sequential discovery/build walk below
+        // reads from a warm cache. No-op for stores without manifest support.
+        let _ = self.warm_layer_stack(name).await;
 
         // find an ancestor in cache
         let mut ancestor = None;
@@ -1534,6 +1626,23 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
                     }
                 }
             }
+        }
+
+        // Prefetch every archive we are about to load in one bounded-concurrency
+        // wave, so the sequential build loop below reads from a warm cache rather
+        // than issuing one blocking round trip per ancestor. Only the uncached
+        // suffix is in `layers_to_load` (the discovery loop stopped at the first
+        // cached ancestor), so this preserves cache short-circuiting. Best-effort:
+        // a prefetch failure is ignored and the build loop fetches authoritatively.
+        {
+            let prefetch_ids: Vec<[u32; 5]> = layers_to_load
+                .iter()
+                .map(|(original, rollup)| match rollup {
+                    Some((rollup_id, _)) => *rollup_id,
+                    None => *original,
+                })
+                .collect();
+            let _ = self.prefetch_layers(&prefetch_ids).await;
         }
 
         if ancestor.is_none() {
@@ -2508,6 +2617,9 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
     }
 
     async fn retrieve_layer_stack_names(&self, name: [u32; 5]) -> io::Result<Vec<[u32; 5]>> {
+        if let Some(chain) = self.stack_names_hint(name).await? {
+            return Ok(chain);
+        }
         let mut result = vec![name];
 
         loop {

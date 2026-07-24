@@ -30,15 +30,26 @@ mod label;
 #[macro_use]
 mod layer;
 pub mod archive;
+#[cfg(feature = "object-store")]
+pub mod block_lazy;
 mod copy;
 pub mod delta;
 mod locking;
 pub mod memory;
+#[cfg(feature = "object-store")]
+pub mod object;
+#[cfg(feature = "object-store")]
+pub mod object_cache;
 pub mod pack;
+pub mod stack_manifest;
 
 pub use cache::*;
 pub use delta::*;
 pub use file::*;
 pub use label::*;
 pub use layer::*;
+#[cfg(feature = "object-store")]
+pub use object::*;
+#[cfg(feature = "object-store")]
+pub use object_cache::*;
 pub use pack::*;

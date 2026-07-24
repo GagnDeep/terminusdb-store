@@ -17,11 +17,6 @@ use std::{
     task::Poll,
 };
 
-#[cfg(not(target_os = "windows"))]
-use std::os::unix::fs::MetadataExt;
-#[cfg(target_os = "windows")]
-use std::os::windows::fs::MetadataExt;
-
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use lru::LruCache;
@@ -58,6 +53,32 @@ pub trait ArchiveBackend: Clone + Send + Sync {
         file_type: LayerFileEnum,
         read_from: usize,
     ) -> io::Result<Self::Read>;
+
+    /// Best-effort concurrent warm of the given layers into this backend's
+    /// cache (if it has one). Default no-op for cacheless backends.
+    async fn prefetch_layers(&self, _ids: &[[u32; 5]]) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Fetch a byte sub-range *within* a layer structure (relative to the start
+    /// of that structure). The default fetches the whole structure and slices;
+    /// backends over object storage override this to issue a bounded ranged GET,
+    /// which is what makes block-lazy structure access possible on a disk-less
+    /// replica (fetch only the blocks a lookup touches).
+    async fn get_layer_structure_range(
+        &self,
+        id: [u32; 5],
+        file_type: LayerFileEnum,
+        range: std::ops::Range<usize>,
+    ) -> io::Result<Bytes> {
+        let whole = self
+            .get_layer_structure_bytes(id, file_type)
+            .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "structure not found"))?;
+        let end = range.end.min(whole.len());
+        let start = range.start.min(end);
+        Ok(whole.slice(start..end))
+    }
 }
 
 #[async_trait]
@@ -74,6 +95,61 @@ pub trait ArchiveMetadataBackend: Clone + Send + Sync {
     async fn get_rollup(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>>;
     async fn set_rollup(&self, id: [u32; 5], rollup: [u32; 5]) -> io::Result<()>;
     async fn get_parent(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>>;
+
+    /// Read the persisted stack manifest for a layer (the encoded ordered
+    /// ancestor id list). Default `None` = no manifest support / not present.
+    async fn get_stack_manifest(&self, _id: [u32; 5]) -> io::Result<Option<Bytes>> {
+        Ok(None)
+    }
+
+    /// Write the persisted stack manifest for a layer. Default no-op.
+    async fn set_stack_manifest(&self, _id: [u32; 5], _bytes: Bytes) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Hook invoked after a layer is finalized so a backend that supports
+    /// manifests can build this layer's manifest from its parent's (O(1) once
+    /// the parent has one). Default no-op — backends without manifest support
+    /// pay nothing.
+    async fn on_layer_finalized(&self, _id: [u32; 5]) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Best-effort concurrent warm of rollup-pointer lookups for the given
+    /// layers, so a subsequent read resolves rollups without a sequential GET
+    /// per ancestor. Default no-op for backends without a rollup cache.
+    async fn prefetch_rollups(&self, _ids: &[[u32; 5]]) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Owns a memory-map so it can back a [`Bytes`] via `Bytes::from_owner`; slices
+/// derived from that `Bytes` keep the mapping alive by reference count.
+pub(crate) struct MmapOwner(memmap2::Mmap);
+
+impl AsRef<[u8]> for MmapOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Memory-map a file into `Bytes`. An empty file maps to empty `Bytes` (mmap
+/// rejects zero-length maps); a missing file returns the underlying open error.
+///
+/// Blocking (file open + mmap); call via `spawn_blocking` from async code. Only
+/// the pages a caller actually touches become resident, and because layer
+/// archives are content-addressed and immutable the mapping never changes
+/// underneath us.
+pub(crate) fn mmap_file(path: &std::path::Path) -> io::Result<Bytes> {
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(Bytes::new());
+    }
+    // SAFETY: the mapped archive is immutable once written (content-addressed),
+    // so it is never mutated or truncated while mapped.
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    Ok(Bytes::from_owner(MmapOwner(mmap)))
 }
 
 pub struct BytesAsyncReader(Bytes);
@@ -129,21 +205,12 @@ impl DirectoryArchiveBackend {
 impl ArchiveBackend for DirectoryArchiveBackend {
     type Read = ArchiveSliceReader;
     async fn get_layer_bytes(&self, id: [u32; 5]) -> io::Result<Bytes> {
+        // Memory-map instead of reading the whole archive into the heap, so only
+        // the pages actually touched become resident (page-cache buffer pool).
         let path = self.path_for_layer(id);
-        let mut options = fs::OpenOptions::new();
-        options.read(true);
-        options.create(false);
-        let mut result = options.open(path).await?;
-        let metadata = result.metadata().await?;
-        #[cfg(target_os = "windows")]
-        let size = metadata.file_size();
-        #[cfg(not(target_os = "windows"))]
-        let size = metadata.size();
-        let mut buf = Vec::with_capacity(size as usize);
-        result.read_to_end(&mut buf).await?;
-        buf.shrink_to_fit();
-
-        Ok(buf.into())
+        tokio::task::spawn_blocking(move || mmap_file(&path))
+            .await
+            .map_err(io::Error::other)?
     }
 
     async fn get_layer_structure_bytes(
@@ -151,20 +218,14 @@ impl ArchiveBackend for DirectoryArchiveBackend {
         id: [u32; 5],
         file_type: LayerFileEnum,
     ) -> io::Result<Option<Bytes>> {
+        // Map the whole archive and return a slice of the requested structure;
+        // the returned `Bytes` shares the mmap, so only the header + that
+        // structure's pages ever fault in.
         let path = self.path_for_layer(id);
-        let mut options = tokio::fs::OpenOptions::new();
-        options.read(true);
-        let mut file = options.open(path).await?;
-        let header = ArchiveHeader::parse_from_reader(&mut file).await?;
-        if let Some(range) = header.range_for(file_type) {
-            let mut data = vec![0; range.len()];
-            file.seek(SeekFrom::Current((range.start) as i64)).await?;
-            file.read_exact(&mut data).await?;
-
-            Ok(Some(Bytes::from(data)))
-        } else {
-            Ok(None)
-        }
+        let bytes = tokio::task::spawn_blocking(move || mmap_file(&path))
+            .await
+            .map_err(io::Error::other)??;
+        Ok(Archive::parse(bytes).slice_for(file_type))
     }
 
     async fn store_layer_file(&self, id: [u32; 5], mut bytes: Bytes) -> io::Result<()> {
@@ -355,11 +416,20 @@ impl ArchiveMetadataBackend for DirectoryArchiveBackend {
     }
 }
 
+/// Maximum number of layer archives fetched concurrently during a prefetch wave.
+const PREFETCH_CONCURRENCY: usize = 16;
+
+/// Cache of rollup-pointer lookups (`layer -> Some(rollup) | None`).
+type RollupCache = Arc<tokio::sync::Mutex<LruCache<[u32; 5], Option<[u32; 5]>>>>;
+
 #[derive(Clone)]
 pub struct LruArchiveBackend<M, D> {
     cache: Arc<tokio::sync::Mutex<LruCache<[u32; 5], CacheEntry>>>,
-    #[cfg(feature = "rollup_metadata_experimental")]
-    rollup_cache: Arc<std::sync::RwLock<HashMap<[u32; 5], Option<[u32; 5]>>>>,
+    /// Rollup layers are content-addressed and immutable, so a cached pointer
+    /// stays valid; `set_rollup` keeps this in-process consistent. Lets a read
+    /// resolve the whole chain's rollups in one parallel wave instead of one
+    /// sequential GET per ancestor.
+    rollup_cache: RollupCache,
     limit: usize,
     current: Arc<AtomicUsize>,
     metadata_origin: M,
@@ -385,11 +455,13 @@ impl CacheEntry {
 impl<M, D> LruArchiveBackend<M, D> {
     pub fn new(metadata_origin: M, data_origin: D, limit: usize) -> Self {
         let cache = Arc::new(tokio::sync::Mutex::new(LruCache::unbounded()));
+        let rollup_cache = Arc::new(tokio::sync::Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(100_000).unwrap(),
+        )));
 
         Self {
             cache,
-            #[cfg(feature = "rollup_metadata_experimental")]
-            rollup_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            rollup_cache,
             limit,
             current: Arc::new(AtomicUsize::new(0)),
             metadata_origin,
@@ -590,6 +662,32 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
                 .await
         }
     }
+    async fn get_layer_structure_range(
+        &self,
+        id: [u32; 5],
+        file_type: LayerFileEnum,
+        range: std::ops::Range<usize>,
+    ) -> io::Result<Bytes> {
+        // If the whole layer is cached, slice from the resident bytes (no extra
+        // transfer). Otherwise delegate to the data origin's true ranged read
+        // rather than the trait default, which would fetch the whole structure
+        // and slice — defeating block-lazy reads through this cache tier.
+        if self.layer_fits_in_cache(id).await? {
+            let whole = self
+                .get_layer_structure_bytes(id, file_type)
+                .await?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "structure not found in archive")
+                })?;
+            let end = range.end.min(whole.len());
+            let start = range.start.min(end);
+            Ok(whole.slice(start..end))
+        } else {
+            self.data_origin
+                .get_layer_structure_range(id, file_type, range)
+                .await
+        }
+    }
     async fn store_layer_file(&self, id: [u32; 5], bytes: Bytes) -> io::Result<()> {
         self.data_origin.store_layer_file(id, bytes.clone()).await?;
 
@@ -628,6 +726,22 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveBackend for LruArchive
             ))
         }
     }
+
+    async fn prefetch_layers(&self, ids: &[[u32; 5]]) -> io::Result<()> {
+        use futures::stream::StreamExt;
+        futures::stream::iter(ids.iter().copied())
+            .for_each_concurrent(PREFETCH_CONCURRENCY, |id| async move {
+                // Only warm layers that fit the RAM budget; `get_layer_bytes`
+                // populates the LRU (and, transitively, any inner data tier such
+                // as the disk-spill cache) and dedupes concurrent fetches via its
+                // Resolving barrier. Errors are swallowed — this is best-effort.
+                if self.layer_fits_in_cache(id).await.unwrap_or(false) {
+                    let _ = self.get_layer_bytes(id).await;
+                }
+            })
+            .await;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -638,25 +752,44 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
         self.metadata_origin.get_layer_names().await
     }
     async fn layer_exists(&self, id: [u32; 5]) -> io::Result<bool> {
-        if let Some(CacheEntry::Resolved(_)) = self.cache.lock().await.peek(&id) {
+        // NB: extract the cached answer in a block so the cache lock is dropped
+        // *before* the fallback origin await — otherwise the guard temporary is
+        // held across `.await`, serializing all concurrent metadata lookups on
+        // the cache mutex (which throttles parallel prefetch).
+        let cached = matches!(
+            self.cache.lock().await.peek(&id),
+            Some(CacheEntry::Resolved(_))
+        );
+        if cached {
             Ok(true)
         } else {
             self.metadata_origin.layer_exists(id).await
         }
     }
     async fn layer_size(&self, id: [u32; 5]) -> io::Result<u64> {
-        if let Some(CacheEntry::Resolved(bytes)) = self.cache.lock().await.peek(&id) {
-            Ok(bytes.len() as u64)
-        } else {
-            self.metadata_origin.layer_size(id).await
+        let cached = {
+            match self.cache.lock().await.peek(&id) {
+                Some(CacheEntry::Resolved(bytes)) => Some(bytes.len() as u64),
+                _ => None,
+            }
+        };
+        match cached {
+            Some(len) => Ok(len),
+            None => self.metadata_origin.layer_size(id).await,
         }
     }
     async fn layer_file_exists(&self, id: [u32; 5], file_type: LayerFileEnum) -> io::Result<bool> {
-        if let Some(CacheEntry::Resolved(bytes)) = self.cache.lock().await.peek(&id) {
-            let header = ArchiveFilePresenceHeader::new(bytes.clone().get_u64());
-            Ok(header.is_present(file_type))
-        } else {
-            self.metadata_origin.layer_file_exists(id, file_type).await
+        let cached = {
+            match self.cache.lock().await.peek(&id) {
+                Some(CacheEntry::Resolved(bytes)) => Some(
+                    ArchiveFilePresenceHeader::new(bytes.clone().get_u64()).is_present(file_type),
+                ),
+                _ => None,
+            }
+        };
+        match cached {
+            Some(present) => Ok(present),
+            None => self.metadata_origin.layer_file_exists(id, file_type).await,
         }
     }
     async fn get_layer_structure_size(
@@ -664,46 +797,51 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
         id: [u32; 5],
         file_type: LayerFileEnum,
     ) -> io::Result<usize> {
-        if let Some(CacheEntry::Resolved(bytes)) = self.cache.lock().await.peek(&id) {
-            let (header, _) = ArchiveHeader::parse(bytes.clone());
-
-            if let Some(size) = header.size_of(file_type) {
-                Ok(size)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "structure {file_type:?} not found in layer {}",
-                        name_to_string(id)
-                    ),
-                ))
+        let cached = {
+            match self.cache.lock().await.peek(&id) {
+                Some(CacheEntry::Resolved(bytes)) => {
+                    Some(ArchiveHeader::parse(bytes.clone()).0.size_of(file_type))
+                }
+                _ => None,
             }
-        } else {
-            self.metadata_origin
-                .get_layer_structure_size(id, file_type)
-                .await
+        };
+        match cached {
+            Some(Some(size)) => Ok(size),
+            Some(None) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "structure {file_type:?} not found in layer {}",
+                    name_to_string(id)
+                ),
+            )),
+            None => {
+                self.metadata_origin
+                    .get_layer_structure_size(id, file_type)
+                    .await
+            }
         }
     }
     async fn get_rollup(&self, id: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
-        #[cfg(feature = "rollup_metadata_experimental")]
-        {
-            if let Some(cached) = self.rollup_cache.read().unwrap().get(&id) {
-                return Ok(*cached);
-            }
+        if let Some(cached) = self.rollup_cache.lock().await.get(&id) {
+            return Ok(*cached);
         }
         let result = self.metadata_origin.get_rollup(id).await?;
-        #[cfg(feature = "rollup_metadata_experimental")]
-        {
-            self.rollup_cache.write().unwrap().insert(id, result);
-        }
+        self.rollup_cache.lock().await.put(id, result);
         Ok(result)
     }
     async fn set_rollup(&self, id: [u32; 5], rollup: [u32; 5]) -> io::Result<()> {
         self.metadata_origin.set_rollup(id, rollup).await?;
-        #[cfg(feature = "rollup_metadata_experimental")]
-        {
-            self.rollup_cache.write().unwrap().insert(id, Some(rollup));
-        }
+        // Keep the rollup cache in-process consistent with the write.
+        self.rollup_cache.lock().await.put(id, Some(rollup));
+        Ok(())
+    }
+    async fn prefetch_rollups(&self, ids: &[[u32; 5]]) -> io::Result<()> {
+        use futures::stream::StreamExt;
+        futures::stream::iter(ids.iter().copied())
+            .for_each_concurrent(PREFETCH_CONCURRENCY, |id| async move {
+                let _ = self.get_rollup(id).await;
+            })
+            .await;
         Ok(())
     }
 
@@ -717,6 +855,16 @@ impl<M: ArchiveMetadataBackend, D: ArchiveBackend> ArchiveMetadataBackend
         } else {
             Ok(None)
         }
+    }
+
+    async fn get_stack_manifest(&self, id: [u32; 5]) -> io::Result<Option<Bytes>> {
+        self.metadata_origin.get_stack_manifest(id).await
+    }
+    async fn set_stack_manifest(&self, id: [u32; 5], bytes: Bytes) -> io::Result<()> {
+        self.metadata_origin.set_stack_manifest(id, bytes).await
+    }
+    async fn on_layer_finalized(&self, id: [u32; 5]) -> io::Result<()> {
+        self.metadata_origin.on_layer_finalized(id).await
     }
 }
 
@@ -1433,11 +1581,53 @@ impl<M, D> ArchiveLayerStore<M, D> {
 
 const PREFIX_DIR_SIZE: usize = 3;
 
+// An `ArchiveLayerStore` can hand out a block source that reads the (small)
+// offset table and individual data blocks via its data backend and reports
+// structure sizes via its metadata backend — the seam `block_source` returns so
+// a `dyn LayerStore` can drive the block-lazy dictionary without exposing its
+// backend types. (Split across the two backends because the data backend need
+// not itself be an `ArchiveMetadataBackend`.)
+#[cfg(feature = "object-store")]
+#[async_trait]
+impl<M: ArchiveMetadataBackend + 'static, D: ArchiveBackend + 'static>
+    crate::storage::block_lazy::BlockSource for ArchiveLayerStore<M, D>
+{
+    async fn structure_bytes(
+        &self,
+        layer: [u32; 5],
+        file: LayerFileEnum,
+    ) -> io::Result<Option<Bytes>> {
+        self.data_backend
+            .get_layer_structure_bytes(layer, file)
+            .await
+    }
+    async fn structure_size(&self, layer: [u32; 5], file: LayerFileEnum) -> io::Result<usize> {
+        self.metadata_backend
+            .get_layer_structure_size(layer, file)
+            .await
+    }
+    async fn structure_range(
+        &self,
+        layer: [u32; 5],
+        file: LayerFileEnum,
+        range: std::ops::Range<usize>,
+    ) -> io::Result<Bytes> {
+        self.data_backend
+            .get_layer_structure_range(layer, file, range)
+            .await
+    }
+}
+
 #[async_trait]
 impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> PersistentLayerStore
     for ArchiveLayerStore<M, D>
 {
     type File = ArchiveLayerHandle<M, D>;
+
+    #[cfg(feature = "object-store")]
+    fn block_source(&self) -> Option<std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>> {
+        Some(std::sync::Arc::new(self.clone()))
+    }
 
     async fn directories(&self) -> io::Result<Vec<[u32; 5]>> {
         let mut result = self.metadata_backend.get_layer_names().await?;
@@ -1576,11 +1766,70 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
 
         self.data_backend
             .store_layer_file(directory, data_buf.freeze())
-            .await
+            .await?;
+
+        // Best-effort stack-manifest maintenance; no-op for backends (directory,
+        // memory) that don't support manifests. Errors are swallowed on purpose:
+        // the manifest is only a read hint, so failing to build it (e.g. an
+        // ancestor archive not yet persisted) must never fail the layer write —
+        // reads fall back to the authoritative parent walk.
+        let _ = self.metadata_backend.on_layer_finalized(directory).await;
+
+        Ok(())
     }
 
     async fn layer_parent(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
         self.metadata_backend.get_parent(name).await
+    }
+
+    async fn prefetch_layers(&self, names: &[[u32; 5]]) -> io::Result<()> {
+        // Delegate to the data backend, which owns the cache that the
+        // subsequent `base_layer_files`/`child_layer_files` reads will hit.
+        self.data_backend.prefetch_layers(names).await
+    }
+
+    async fn stack_names_hint(&self, name: [u32; 5]) -> io::Result<Option<Vec<[u32; 5]>>> {
+        // One request for the whole chain, instead of one round trip per
+        // ancestor. Manifests are stored head-first; callers want oldest-first.
+        let bytes = match self.metadata_backend.get_stack_manifest(name).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let manifest = match crate::storage::stack_manifest::StackManifest::decode(bytes) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        // Validate before trusting: it must be this layer's chain and non-empty.
+        // Anything else falls through to the authoritative walk.
+        if !manifest.is_for(name) || manifest.layers.is_empty() {
+            return Ok(None);
+        }
+        let mut chain = manifest.layers;
+        chain.reverse();
+        Ok(Some(chain))
+    }
+
+    async fn warm_layer_stack(&self, name: [u32; 5]) -> io::Result<()> {
+        // If a manifest is present, learn the whole ancestor chain in one GET
+        // and warm every archive in parallel, so the sequential discovery/build
+        // walk that follows hits a warm cache instead of doing one round trip
+        // per ancestor. Hint-only: on absence/parse/validation failure we do
+        // nothing and the authoritative walk proceeds unchanged.
+        if let Some(bytes) = self.metadata_backend.get_stack_manifest(name).await? {
+            if let Some(manifest) = crate::storage::stack_manifest::StackManifest::decode(bytes) {
+                if manifest.is_for(name) {
+                    // Warm archives and rollup pointers in parallel, so the
+                    // sequential discovery walk hits both caches.
+                    let (data, meta) = futures::join!(
+                        self.data_backend.prefetch_layers(&manifest.layers),
+                        self.metadata_backend.prefetch_rollups(&manifest.layers),
+                    );
+                    data?;
+                    meta?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1608,7 +1857,9 @@ mod tests {
         assert!(!header.is_present(LayerFileEnum::NodeDictionaryOffsets));
     }
 
-    #[cfg(feature = "rollup_metadata_experimental")]
+    // Upstream gated the rollup-pointer cache behind `rollup_metadata_experimental`.
+    // Here it is unconditional (bounded LRU + parallel prefetch), so these tests
+    // run unconditionally too.
     mod rollup_metadata_cache_tests {
         use super::*;
         use std::sync::atomic::AtomicUsize;

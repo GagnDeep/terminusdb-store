@@ -7,9 +7,11 @@ pub mod builder;
 pub mod id_map;
 mod internal;
 mod layer;
+pub mod overlay;
 mod simple_builder;
 
 pub use id_map::*;
 pub use internal::*;
 pub use layer::*;
+pub use overlay::*;
 pub use simple_builder::*;

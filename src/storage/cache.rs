@@ -188,6 +188,11 @@ impl LayerCache for LockingHashMapLayerCache {
 pub struct CachedLayerStore {
     pub(crate) inner: Arc<dyn LayerStore>,
     pub(crate) cache: Arc<dyn LayerCache>,
+    /// Immutable per-layer entry counts (node=0, predicate=1, value=2), so the
+    /// selective read path — which does not populate the `InternalLayer` cache —
+    /// resolves a count once per layer instead of re-reading it for the offset
+    /// computation, each block-lazy threshold check, and every id-map load.
+    counts: Arc<std::sync::Mutex<lru::LruCache<([u32; 5], u8), u64>>>,
 }
 
 impl CachedLayerStore {
@@ -195,7 +200,27 @@ impl CachedLayerStore {
         CachedLayerStore {
             inner: Arc::new(inner),
             cache: Arc::new(cache),
+            counts: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(16384).unwrap(),
+            ))),
         }
+    }
+
+    /// A count served from the immutable per-layer cache, or fetched via `f` and
+    /// cached (only `Some` values — an absent count may appear once finalized).
+    async fn cached_count<F, Fut>(&self, name: [u32; 5], kind: u8, f: F) -> io::Result<Option<u64>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = io::Result<Option<u64>>>,
+    {
+        if let Some(v) = self.counts.lock().unwrap().get(&(name, kind)).copied() {
+            return Ok(Some(v));
+        }
+        let v = f().await?;
+        if let Some(v) = v {
+            self.counts.lock().unwrap().put((name, kind), v);
+        }
+        Ok(v)
     }
 
     pub fn invalidate(&self, name: [u32; 5]) {
@@ -224,10 +249,23 @@ impl LayerStore for CachedLayerStore {
         self.inner.layers().await
     }
 
+    #[cfg(feature = "object-store")]
+    fn block_source(&self) -> Option<std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>> {
+        self.inner.block_source()
+    }
+
     async fn get_layer(&self, name: [u32; 5]) -> io::Result<Option<Arc<InternalLayer>>> {
         self.inner
             .get_layer_with_cache(name, self.cache.clone())
             .await
+    }
+
+    async fn layer_exists(&self, name: [u32; 5]) -> io::Result<bool> {
+        self.inner.layer_exists(name).await
+    }
+
+    async fn read_rollup(&self, name: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+        self.inner.read_rollup(name).await
     }
 
     async fn get_layer_with_cache(
@@ -296,7 +334,8 @@ impl LayerStore for CachedLayerStore {
             }
         }
 
-        self.inner.get_node_count(name).await
+        self.cached_count(name, 0, || self.inner.get_node_count(name))
+            .await
     }
 
     async fn get_predicate_count(&self, name: [u32; 5]) -> io::Result<Option<u64>> {
@@ -308,7 +347,8 @@ impl LayerStore for CachedLayerStore {
             }
         }
 
-        self.inner.get_value_count(name).await
+        self.cached_count(name, 1, || self.inner.get_predicate_count(name))
+            .await
     }
 
     async fn get_value_count(&self, name: [u32; 5]) -> io::Result<Option<u64>> {
@@ -320,7 +360,8 @@ impl LayerStore for CachedLayerStore {
             }
         }
 
-        self.inner.get_value_count(name).await
+        self.cached_count(name, 2, || self.inner.get_value_count(name))
+            .await
     }
 
     async fn get_node_value_idmap(&self, name: [u32; 5]) -> io::Result<Option<IdMap>> {

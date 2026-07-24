@@ -222,6 +222,21 @@ pub struct InternalTripleSubjectIterator {
 }
 
 impl InternalTripleSubjectIterator {
+    /// Build the stack-merge iterator directly from per-layer addition and
+    /// removal iterators, ordered **head-first** (index 0 is the most recent
+    /// layer). This lets a caller assemble the merge from disk-less per-layer
+    /// iterators without a materialized `InternalLayer` stack; the reconciliation
+    /// in [`Iterator::next`] is identical to [`Self::from_layer`].
+    pub fn from_iterators(
+        positives: Vec<OptInternalLayerTripleSubjectIterator>,
+        negatives: Vec<OptInternalLayerTripleSubjectIterator>,
+    ) -> Self {
+        Self {
+            positives,
+            negatives,
+        }
+    }
+
     pub fn from_layer(layer: &InternalLayer) -> Self {
         let stack_size = layer.layer_stack_size();
         let mut positives = Vec::with_capacity(stack_size);

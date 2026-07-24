@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 use crate::layer::{IdTriple, Layer, LayerBuilder, LayerCounts, ObjectType, ValueTriple};
 use crate::store::{
-    open_directory_store, open_memory_store, NamedGraph, Store, StoreLayer, StoreLayerBuilder,
+    open_directory_store, open_memory_store, LazyLayer, NamedGraph, Store, StoreLayer,
+    StoreLayerBuilder,
 };
 use tdb_succinct::TypedDictEntry;
 
@@ -533,6 +534,206 @@ impl SyncNamedGraph {
     }
 }
 
+/// Synchronous, **disk-less** query handle over one graph — the sync twin of
+/// [`LazyLayer`], and the integration seam for a synchronous query engine that
+/// wants the block-lazy read path.
+///
+/// Every method mirrors the like-named method on the [`Layer`] trait (which the
+/// materialized [`SyncStoreLayer`] implements), but answers it by fetching only
+/// the blocks a query touches instead of loading a whole layer. So a caller can
+/// swap a materialized `SyncStoreLayer` for a `SyncLazyLayer` to make a read path
+/// disk-less, changing only where the layer handle comes from. Each call blocks
+/// on the shared runtime, exactly like the rest of this facade.
+///
+/// Obtain one with [`SyncStore::lazy_layer`].
+#[derive(Clone)]
+pub struct SyncLazyLayer {
+    inner: LazyLayer,
+}
+
+impl SyncLazyLayer {
+    /// The head layer id this handle reads.
+    pub fn name(&self) -> [u32; 5] {
+        self.inner.name()
+    }
+
+    // ---- chain metadata ----
+    pub fn node_and_value_count(&self) -> io::Result<u64> {
+        task_sync(self.inner.node_and_value_count())
+    }
+    pub fn predicate_count(&self) -> io::Result<u64> {
+        task_sync(self.inner.predicate_count())
+    }
+    pub fn materialize(&self) -> io::Result<Option<SyncStoreLayer>> {
+        Ok(task_sync(self.inner.materialize())?.map(SyncStoreLayer::wrap))
+    }
+    pub fn triple_layer_addition_count(&self) -> io::Result<usize> {
+        task_sync(self.inner.triple_layer_addition_count())
+    }
+    pub fn triple_layer_removal_count(&self) -> io::Result<usize> {
+        task_sync(self.inner.triple_layer_removal_count())
+    }
+    pub fn triple_addition_count(&self) -> io::Result<usize> {
+        task_sync(self.inner.triple_addition_count())
+    }
+    pub fn triple_removal_count(&self) -> io::Result<usize> {
+        task_sync(self.inner.triple_removal_count())
+    }
+    pub fn triple_count(&self) -> io::Result<usize> {
+        task_sync(self.inner.triple_count())
+    }
+    pub fn parent_name(&self) -> io::Result<Option<[u32; 5]>> {
+        task_sync(self.inner.parent_name())
+    }
+    pub fn parent(&self) -> io::Result<Option<SyncLazyLayer>> {
+        Ok(task_sync(self.inner.parent())?.map(|inner| SyncLazyLayer { inner }))
+    }
+    pub fn retrieve_layer_stack_names(&self) -> io::Result<Vec<[u32; 5]>> {
+        task_sync(self.inner.retrieve_layer_stack_names())
+    }
+
+    // ---- existence ----
+    pub fn triple_exists(&self, subject: u64, predicate: u64, object: u64) -> io::Result<bool> {
+        task_sync(self.inner.triple_exists(subject, predicate, object))
+    }
+    pub fn id_triple_exists(&self, triple: IdTriple) -> io::Result<bool> {
+        task_sync(self.inner.id_triple_exists(triple))
+    }
+    pub fn value_triple_exists(&self, triple: &ValueTriple) -> io::Result<bool> {
+        task_sync(self.inner.value_triple_exists(triple))
+    }
+
+    // ---- traversal ----
+    pub fn triples_s(&self, subject: u64) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_s(subject))
+    }
+    pub fn triples_sp(&self, subject: u64, predicate: u64) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_sp(subject, predicate))
+    }
+    pub fn triples_p(&self, predicate: u64) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_p(predicate))
+    }
+    pub fn triples_value_range(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_value_range(low, high))
+    }
+    pub fn triples_value_range_rev(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_value_range_rev(low, high))
+    }
+    pub fn triples_o(&self, object: u64) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_o(object))
+    }
+    /// Every id-triple in the graph, disk-lessly (adjacency-only, merge-streamed).
+    pub fn triples(&self) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triples())
+            .map(|it| Box::new(it) as Box<dyn Iterator<Item = IdTriple> + Send>)
+    }
+
+    // ---- single-layer deltas (this head layer's own additions/removals) ----
+    // Mirror the SyncStoreLayer delta API the store-prolog FFI predicates need;
+    // disk-less (only this layer's adjacency is loaded).
+    pub fn triple_addition_exists(&self, s: u64, p: u64, o: u64) -> io::Result<bool> {
+        task_sync(self.inner.triple_addition_exists(s, p, o))
+    }
+    pub fn triple_removal_exists(&self, s: u64, p: u64, o: u64) -> io::Result<bool> {
+        task_sync(self.inner.triple_removal_exists(s, p, o))
+    }
+    pub fn triple_additions(&self) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_additions())
+    }
+    pub fn triple_removals(&self) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_removals())
+    }
+    pub fn triple_additions_s(
+        &self,
+        subject: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_additions_s(subject))
+    }
+    pub fn triple_removals_s(
+        &self,
+        subject: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_removals_s(subject))
+    }
+    pub fn triple_additions_sp(
+        &self,
+        subject: u64,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_additions_sp(subject, predicate))
+    }
+    pub fn triple_removals_sp(
+        &self,
+        subject: u64,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_removals_sp(subject, predicate))
+    }
+    pub fn triple_additions_p(
+        &self,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_additions_p(predicate))
+    }
+    pub fn triple_removals_p(
+        &self,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_removals_p(predicate))
+    }
+    pub fn triple_additions_o(
+        &self,
+        object: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_additions_o(object))
+    }
+    pub fn triple_removals_o(
+        &self,
+        object: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        task_sync(self.inner.triple_removals_o(object))
+    }
+
+    // ---- forward resolution (string -> id) ----
+    pub fn subject_id(&self, subject: &str) -> io::Result<Option<u64>> {
+        task_sync(self.inner.subject_id(subject))
+    }
+    pub fn predicate_id(&self, predicate: &str) -> io::Result<Option<u64>> {
+        task_sync(self.inner.predicate_id(predicate))
+    }
+    pub fn object_node_id(&self, object: &str) -> io::Result<Option<u64>> {
+        task_sync(self.inner.object_node_id(object))
+    }
+    pub fn object_value_id(&self, object: &TypedDictEntry) -> io::Result<Option<u64>> {
+        task_sync(self.inner.object_value_id(object))
+    }
+    pub fn value_triple_to_id(&self, triple: &ValueTriple) -> io::Result<Option<IdTriple>> {
+        task_sync(self.inner.value_triple_to_id(triple))
+    }
+
+    // ---- reverse resolution (id -> string/value) ----
+    pub fn id_subject(&self, id: u64) -> io::Result<Option<String>> {
+        task_sync(self.inner.id_subject(id))
+    }
+    pub fn id_predicate(&self, id: u64) -> io::Result<Option<String>> {
+        task_sync(self.inner.id_predicate(id))
+    }
+    pub fn id_object(&self, id: u64) -> io::Result<Option<ObjectType>> {
+        task_sync(self.inner.id_object(id))
+    }
+    pub fn id_triple_to_string(&self, triple: IdTriple) -> io::Result<Option<ValueTriple>> {
+        task_sync(self.inner.id_triple_to_string(triple))
+    }
+}
+
 /// A store, storing a set of layers and database labels pointing to these layers.
 #[derive(Clone)]
 pub struct SyncStore {
@@ -580,6 +781,51 @@ impl SyncStore {
         let inner = task_sync(self.inner.get_layer_from_id(layer));
 
         inner.map(|layer| layer.map(SyncStoreLayer::wrap))
+    }
+
+    /// A **disk-less** query handle over the graph headed by `layer`: the common
+    /// read operations answered by fetching only the blocks a query touches,
+    /// without materializing a whole layer (unlike [`get_layer_from_id`]). This
+    /// is the synchronous integration seam for a query engine that wants the
+    /// disk-less read path but is itself synchronous. See [`SyncLazyLayer`].
+    ///
+    /// [`get_layer_from_id`]: Self::get_layer_from_id
+    pub fn lazy_layer(&self, layer: [u32; 5]) -> SyncLazyLayer {
+        SyncLazyLayer {
+            inner: self.inner.lazy_layer(layer),
+        }
+    }
+
+    /// Whether a layer exists, without materializing it.
+    pub fn layer_exists(&self, layer: [u32; 5]) -> io::Result<bool> {
+        task_sync(self.inner.layer_exists(layer))
+    }
+
+    /// The rollup registered for `head`, if any — whether background compaction
+    /// has flattened it. Useful for monitoring the compaction policy.
+    pub fn rollup_of(&self, head: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+        task_sync(self.inner.rollup_of(head))
+    }
+
+    /// Start background rollup compaction: every `interval`, roll up (never
+    /// squash) any label head whose effective layer stack exceeds `max_depth`.
+    ///
+    /// This is what keeps disk-less reads cheap. A deep chain costs roughly two
+    /// object-store requests per layer; a rolled-up graph costs a handful total,
+    /// because the read paths follow the rollup pointer. Rollup is
+    /// non-destructive, so history and the per-commit audit trail are preserved.
+    ///
+    /// The task runs on this module's shared runtime, so it keeps running
+    /// without a caller holding an async context. Aborting the returned handle
+    /// stops it; dropping the handle does not.
+    pub fn spawn_compaction(
+        &self,
+        max_depth: usize,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        // spawn_compaction calls tokio::spawn, which needs a runtime in scope.
+        let _guard = RUNTIME.enter();
+        self.inner.spawn_compaction(max_depth, interval)
     }
 
     /// Create a base layer builder, unattached to any database label.
@@ -687,6 +933,306 @@ pub fn open_sync_raw_archive_store<P: Into<PathBuf>>(path: P) -> SyncStore {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Background compaction started through the sync facade must actually run
+    /// on the shared runtime and roll a deep chain up, so a later read sees a
+    /// shallow rollup. This is the path TerminusDB uses.
+    #[test]
+    fn sync_spawn_compaction_rolls_up_in_background() {
+        let store = open_sync_memory_store();
+        let db = store.create("g").unwrap();
+
+        let builder = store.create_base_layer().unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("a", "p", "b"))
+            .unwrap();
+        let mut layer = builder.commit().unwrap();
+        db.set_head(&layer).unwrap();
+        for i in 0..6 {
+            let b = layer.open_write().unwrap();
+            b.add_value_triple(ValueTriple::new_string_value(
+                &format!("k{i}"),
+                "p",
+                &format!("v{i}"),
+            ))
+            .unwrap();
+            layer = b.commit().unwrap();
+            db.set_head(&layer).unwrap();
+        }
+        let head = layer.name();
+
+        // deep chain before compaction
+        assert!(
+            store
+                .lazy_layer(head)
+                .retrieve_layer_stack_names()
+                .unwrap()
+                .len()
+                > 2
+        );
+
+        let handle = store.spawn_compaction(2, std::time::Duration::from_millis(10));
+
+        // wait for the background task to roll it up (bounded, not a race)
+        let mut rolled = false;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if store.rollup_of(head).unwrap().is_some() {
+                rolled = true;
+                break;
+            }
+        }
+        handle.abort();
+        assert!(
+            rolled,
+            "background compaction should have rolled the head up"
+        );
+
+        // contents preserved, and the read is now shallow
+        let l = store.get_layer_from_id(head).unwrap().unwrap();
+        assert!(l.value_triple_exists(&ValueTriple::new_string_value("a", "p", "b")));
+        assert!(l.value_triple_exists(&ValueTriple::new_string_value("k5", "p", "v5")));
+    }
+
+    // The synchronous disk-less handle must answer exactly like the materialized
+    // sync layer, over a graph large enough to drive the block-lazy path.
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn sync_lazy_layer_matches_materialized_disk_less() {
+        use crate::store::open_object_store;
+        use std::sync::Arc;
+
+        let bucket: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let store = SyncStore::wrap(open_object_store(bucket, "", 1 << 30));
+        let db = store.create("g").unwrap();
+        let builder = store.create_base_layer().unwrap();
+        for i in 0..700 {
+            builder
+                .add_value_triple(ValueTriple::new_string_value(
+                    &format!("n{:04}", i),
+                    "p",
+                    &format!("o{:04}", i),
+                ))
+                .unwrap();
+        }
+        let layer = builder.commit().unwrap();
+        db.set_head(&layer).unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).unwrap().unwrap(); // materialized (Layer)
+        let lazy = store.lazy_layer(head); // disk-less
+        assert_eq!(head, lazy.name());
+
+        // value ranges: the bounds are deliberately chosen so the range is a
+        // strict subset -- an all-encompassing range would pass even if the
+        // bound arithmetic were wrong
+        let lo = <String as tdb_succinct::TdbDataType>::make_entry(&"o0100");
+        let hi = <String as tdb_succinct::TdbDataType>::make_entry(&"o0200");
+        let mut fr = full.triples_value_range(&lo, &hi).collect::<Vec<_>>();
+        let mut lr = lazy.triples_value_range(&lo, &hi).unwrap();
+        fr.sort();
+        lr.sort();
+        assert!(!fr.is_empty(), "value-range check must not be vacuous");
+        assert!(
+            fr.len() < full.triples().count(),
+            "range must be a strict subset"
+        );
+        assert_eq!(fr, lr);
+
+        let mut fr = full.triples_value_range_rev(&lo, &hi).collect::<Vec<_>>();
+        let mut lr = lazy.triples_value_range_rev(&lo, &hi).unwrap();
+        fr.sort();
+        lr.sort();
+        assert_eq!(fr, lr);
+        // and the reverse variant really is reversed
+        let objs: Vec<u64> = lazy
+            .triples_value_range_rev(&lo, &hi)
+            .unwrap()
+            .iter()
+            .map(|t| t.object)
+            .collect();
+        let mut ascending = objs.clone();
+        ascending.sort_unstable();
+        ascending.reverse();
+        assert_eq!(objs, ascending, "rev must yield descending object order");
+
+        // a bound whose datatype has no segment in the dictionary yields nothing
+        let int_lo = <u32 as tdb_succinct::TdbDataType>::make_entry(&1);
+        let int_hi = <u32 as tdb_succinct::TdbDataType>::make_entry(&99);
+        assert!(lazy
+            .triples_value_range(&int_lo, &int_hi)
+            .unwrap()
+            .is_empty());
+        // mismatched bound datatypes describe no range
+        assert!(lazy.triples_value_range(&lo, &int_hi).unwrap().is_empty());
+
+        // forward resolution + existence
+        let sid = full.subject_id("n0100");
+        assert!(sid.is_some());
+        assert_eq!(sid, lazy.subject_id("n0100").unwrap());
+        assert_eq!(full.predicate_id("p"), lazy.predicate_id("p").unwrap());
+        let vt = ValueTriple::new_string_value("n0100", "p", "o0100");
+        assert!(lazy.value_triple_exists(&vt).unwrap());
+        assert_eq!(
+            full.value_triple_to_id(&vt),
+            lazy.value_triple_to_id(&vt).unwrap()
+        );
+
+        // traversal + reverse resolution
+        let s = sid.unwrap();
+        let mut a: Vec<IdTriple> = full.triples_s(s).collect();
+        let mut b = lazy.triples_s(s).unwrap();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+        assert_eq!(full.id_subject(s), lazy.id_subject(s).unwrap());
+        for t in &a {
+            assert_eq!(
+                full.id_triple_to_string(t),
+                lazy.id_triple_to_string(*t).unwrap()
+            );
+        }
+
+        // full scan
+        let mut es: Vec<IdTriple> = full.triples().collect();
+        let mut ls: Vec<IdTriple> = lazy.triples().unwrap().collect();
+        es.sort();
+        ls.sort();
+        assert_eq!(es, ls);
+    }
+
+    // The disk-less single-layer delta iterators must match the materialized
+    // head layer's own additions/removals (what the store-prolog FFI needs).
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn sync_lazy_layer_deltas_match_materialized() {
+        use crate::store::open_object_store;
+        use std::sync::Arc;
+
+        let bucket: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let store = SyncStore::wrap(open_object_store(bucket, "", 1 << 30));
+        let db = store.create("g").unwrap();
+        let vn = |s: &str, o: &str| ValueTriple::new_node(s, "rel", o);
+
+        let builder = store.create_base_layer().unwrap();
+        for i in 0..600 {
+            builder
+                .add_value_triple(vn(&format!("n{:04}", i), &format!("n{:04}", (i + 1) % 600)))
+                .unwrap();
+        }
+        let mut layer = builder.commit().unwrap();
+        db.set_head(&layer).unwrap();
+        // child layer with its own additions and removals -> the head has a delta
+        let builder = layer.open_write().unwrap();
+        for i in 600..640 {
+            builder
+                .add_value_triple(vn(&format!("n{:04}", i), &format!("n{:04}", i)))
+                .unwrap();
+        }
+        for i in 0..20 {
+            builder
+                .remove_value_triple(vn(&format!("n{:04}", i), &format!("n{:04}", (i + 1) % 600)))
+                .unwrap();
+        }
+        layer = builder.commit().unwrap();
+        db.set_head(&layer).unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).unwrap().unwrap(); // materialized head
+        let lazy = store.lazy_layer(head); // disk-less
+
+        // counts across the chain, computed from per-layer metadata rather than
+        // by materializing anything
+        assert_eq!(
+            full.triple_addition_count(),
+            lazy.triple_addition_count().unwrap()
+        );
+        assert_eq!(
+            full.triple_removal_count(),
+            lazy.triple_removal_count().unwrap()
+        );
+        assert_eq!(full.triple_count(), lazy.triple_count().unwrap());
+        assert!(lazy.triple_removal_count().unwrap() > 0, "not vacuous");
+        assert_eq!(
+            full.triple_layer_addition_count().unwrap(),
+            lazy.triple_layer_addition_count().unwrap()
+        );
+        assert_eq!(
+            full.triple_layer_removal_count().unwrap(),
+            lazy.triple_layer_removal_count().unwrap()
+        );
+
+        // and the escape hatch really does yield the same layer
+        assert_eq!(
+            lazy.materialize().unwrap().map(|m| m.name()),
+            Some(full.name())
+        );
+
+        // existence, without materializing: true for a real layer, false for a
+        // well-formed name that was never stored (which is what store_id_layer
+        // relies on to fail rather than hand out a doomed handle)
+        assert!(store.layer_exists(head).unwrap());
+        assert!(!store.layer_exists([0xdead, 0xbeef, 0, 0, 0]).unwrap());
+
+        // chain metadata over a real base+child chain, so the cumulative sums
+        // are actually exercised rather than trivially matching a single layer
+        assert!(full.parent().unwrap().is_some());
+        assert_eq!(
+            full.parent().unwrap().map(|p| p.name()),
+            lazy.parent_name().unwrap()
+        );
+        assert_eq!(
+            full.node_and_value_count() as u64,
+            lazy.node_and_value_count().unwrap()
+        );
+        assert_eq!(
+            full.predicate_count() as u64,
+            lazy.predicate_count().unwrap()
+        );
+        assert_eq!(
+            full.retrieve_layer_stack_names().unwrap(),
+            lazy.retrieve_layer_stack_names().unwrap()
+        );
+
+        let sorted = |it: Box<dyn Iterator<Item = IdTriple> + Send>| {
+            let mut v: Vec<IdTriple> = it.collect();
+            v.sort();
+            v
+        };
+
+        let fa = sorted(full.triple_additions().unwrap());
+        let la = sorted(lazy.triple_additions().unwrap());
+        assert_eq!(fa, la);
+        assert!(!fa.is_empty());
+        let fr = sorted(full.triple_removals().unwrap());
+        let lr = sorted(lazy.triple_removals().unwrap());
+        assert_eq!(fr, lr);
+        assert!(!fr.is_empty());
+
+        // exists + filtered variants on a real addition and removal
+        let a = fa[0];
+        assert!(lazy
+            .triple_addition_exists(a.subject, a.predicate, a.object)
+            .unwrap());
+        assert_eq!(
+            sorted(full.triple_additions_s(a.subject).unwrap()),
+            sorted(lazy.triple_additions_s(a.subject).unwrap())
+        );
+        assert_eq!(
+            sorted(full.triple_additions_o(a.object).unwrap()),
+            sorted(lazy.triple_additions_o(a.object).unwrap())
+        );
+        let r = fr[0];
+        assert!(lazy
+            .triple_removal_exists(r.subject, r.predicate, r.object)
+            .unwrap());
+        assert_eq!(
+            sorted(full.triple_removals_s(r.subject).unwrap()),
+            sorted(lazy.triple_removals_s(r.subject).unwrap())
+        );
+    }
 
     #[test]
     fn create_and_manipulate_sync_memory_database() {

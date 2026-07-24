@@ -1,7 +1,10 @@
 //! High-level API for working with terminus-store.
 //!
 //! It is expected that most users of this library will work exclusively with the types contained in this module.
+pub mod buffered;
+pub mod compaction;
 pub mod sync;
+pub mod wal;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -838,6 +841,113 @@ impl NamedGraph {
     }
 }
 
+/// Reconcile per-layer `(additions, removals)` given head-first into the set of
+/// id-triples that exist: the newest layer that mentions a triple decides it
+/// (an addition includes it, a removal excludes it). Result is sorted.
+fn reconcile_layered(per_layer_head_first: Vec<(Vec<IdTriple>, Vec<IdTriple>)>) -> Vec<IdTriple> {
+    use std::collections::HashSet;
+    let mut result: HashSet<IdTriple> = HashSet::new();
+    let mut seen: HashSet<IdTriple> = HashSet::new();
+    for (adds, removes) in per_layer_head_first {
+        for t in adds {
+            if seen.insert(t) {
+                result.insert(t);
+            }
+        }
+        for t in removes {
+            seen.insert(t);
+        }
+    }
+    let mut v: Vec<IdTriple> = result.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Minimum dictionary size (entries) at which the block-lazy read path is worth
+/// its per-lookup overhead (offset table + O(log n) block fetches). Below this a
+/// dictionary is small enough that one whole-dictionary GET transfers fewer
+/// bytes; above it, fetching only the touched blocks wins. Chosen from the
+/// object-store byte-transfer measurements (~64 blocks).
+#[cfg(feature = "object-store")]
+const BLOCK_LAZY_MIN_ENTRIES: u64 = 512;
+
+/// Which string dictionary a selective resolution targets. Nodes and predicates
+/// are both string dictionaries and share resolution logic; only the dictionary
+/// files and id-map differ.
+#[derive(Clone, Copy)]
+enum DictKind {
+    Node,
+    Predicate,
+}
+
+/// The layer structures making up one signed (additions or removals) adjacency
+/// index — the `subjects` array plus the s→p and (s,p)→o adjacency lists' `nums`
+/// arrays and bit indexes. Additions and removals differ only by these files.
+#[cfg(feature = "object-store")]
+struct AdjFiles {
+    subjects: crate::storage::consts::LayerFileEnum,
+    sp_nums: crate::storage::consts::LayerFileEnum,
+    sp_bits: crate::storage::consts::LayerFileEnum,
+    sp_blocks: crate::storage::consts::LayerFileEnum,
+    sp_sblocks: crate::storage::consts::LayerFileEnum,
+    spo_nums: crate::storage::consts::LayerFileEnum,
+    spo_bits: crate::storage::consts::LayerFileEnum,
+    spo_blocks: crate::storage::consts::LayerFileEnum,
+    spo_sblocks: crate::storage::consts::LayerFileEnum,
+}
+
+#[cfg(feature = "object-store")]
+const ADJ_POS: AdjFiles = {
+    use crate::storage::consts::LayerFileEnum::*;
+    AdjFiles {
+        subjects: PosSubjects,
+        sp_nums: PosSPAdjacencyListNums,
+        sp_bits: PosSPAdjacencyListBits,
+        sp_blocks: PosSPAdjacencyListBitIndexBlocks,
+        sp_sblocks: PosSPAdjacencyListBitIndexSBlocks,
+        spo_nums: PosSpOAdjacencyListNums,
+        spo_bits: PosSpOAdjacencyListBits,
+        spo_blocks: PosSpOAdjacencyListBitIndexBlocks,
+        spo_sblocks: PosSpOAdjacencyListBitIndexSBlocks,
+    }
+};
+
+#[cfg(feature = "object-store")]
+const ADJ_NEG: AdjFiles = {
+    use crate::storage::consts::LayerFileEnum::*;
+    AdjFiles {
+        subjects: NegSubjects,
+        sp_nums: NegSPAdjacencyListNums,
+        sp_bits: NegSPAdjacencyListBits,
+        sp_blocks: NegSPAdjacencyListBitIndexBlocks,
+        sp_sblocks: NegSPAdjacencyListBitIndexSBlocks,
+        spo_nums: NegSpOAdjacencyListNums,
+        spo_bits: NegSpOAdjacencyListBits,
+        spo_blocks: NegSpOAdjacencyListBitIndexBlocks,
+        spo_sblocks: NegSpOAdjacencyListBitIndexSBlocks,
+    }
+};
+
+/// Resolve `s` to its in-layer id via the fully-loaded dictionary (the fallback
+/// used when the backend does not support ranged block reads).
+async fn resolve_full(
+    ls: &Arc<dyn LayerStore>,
+    kind: DictKind,
+    layer: [u32; 5],
+    s: &str,
+) -> io::Result<Option<u64>> {
+    Ok(match kind {
+        DictKind::Node => ls
+            .get_node_dictionary(layer)
+            .await?
+            .and_then(|d| d.id(&s).into_option()),
+        DictKind::Predicate => ls
+            .get_predicate_dictionary(layer)
+            .await?
+            .and_then(|d| d.id(&s).into_option()),
+    })
+}
+
 impl Store {
     /// Create a new store from the given label and layer store.
     pub fn new<Labels: 'static + LabelStore, Layers: 'static + LayerStore>(
@@ -894,6 +1004,1101 @@ impl Store {
     pub async fn get_layer_from_id(&self, layer: [u32; 5]) -> io::Result<Option<StoreLayer>> {
         let layer = self.layer_store.get_layer(layer).await?;
         Ok(layer.map(|layer| StoreLayer::wrap(layer, self.clone())))
+    }
+
+    /// Check whether an id-level triple exists in the graph headed by `head`,
+    /// loading only the adjacency structures of each layer rather than
+    /// materializing whole layers. This is the low-memory / disk-less read path:
+    /// it never fetches dictionaries, object indexes, or wavelet trees, so on a
+    /// disk-less replica it transfers and holds far fewer bytes than a full
+    /// `get_layer`.
+    ///
+    /// The ids must already be resolved in `head`'s numbering (e.g. via a layer's
+    /// `value_triple_to_id`). Correct regardless of rollups: it consults the
+    /// authoritative parent chain, whose per-layer additions/removals are the
+    /// ground truth a rollup is only derived from. (Phase 3, Stage 1a; string
+    /// resolution via selective dictionary loading is a later increment.)
+    pub async fn selective_id_triple_exists(
+        &self,
+        head: [u32; 5],
+        triple: IdTriple,
+    ) -> io::Result<bool> {
+        // `retrieve_layer_stack_names` returns the chain base-first; walk it
+        // head-first so the newest layer that mentions the triple wins.
+        let chain = self.read_chain(head).await?;
+        // When the backend supports ranged reads, resolve existence via block-
+        // lazy adjacency (fetch only the touched `nums` words, not the whole
+        // adjacency array); otherwise use the whole-structure primitives.
+        #[cfg(feature = "object-store")]
+        let block_source = self.layer_store.block_source();
+        for &layer in chain.iter().rev() {
+            let (added, removed) = {
+                #[cfg(feature = "object-store")]
+                {
+                    if let Some(src) = &block_source {
+                        // Additions and removals index independently — check both
+                        // concurrently.
+                        futures::try_join!(
+                            self.block_lazy_sign_exists(src, layer, &ADJ_POS, triple),
+                            self.block_lazy_sign_exists(src, layer, &ADJ_NEG, triple),
+                        )?
+                    } else {
+                        (
+                            self.layer_store
+                                .triple_addition_exists(
+                                    layer,
+                                    triple.subject,
+                                    triple.predicate,
+                                    triple.object,
+                                )
+                                .await?,
+                            self.layer_store
+                                .triple_removal_exists(
+                                    layer,
+                                    triple.subject,
+                                    triple.predicate,
+                                    triple.object,
+                                )
+                                .await?,
+                        )
+                    }
+                }
+                #[cfg(not(feature = "object-store"))]
+                {
+                    (
+                        self.layer_store
+                            .triple_addition_exists(
+                                layer,
+                                triple.subject,
+                                triple.predicate,
+                                triple.object,
+                            )
+                            .await?,
+                        self.layer_store
+                            .triple_removal_exists(
+                                layer,
+                                triple.subject,
+                                triple.predicate,
+                                triple.object,
+                            )
+                            .await?,
+                    )
+                }
+            };
+            if added {
+                return Ok(true);
+            }
+            if removed {
+                return Ok(false);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Resolve a node/predicate string to its global id by walking the chain
+    /// head-first. When the backend supports ranged structure reads (object
+    /// store), each per-layer lookup uses a [`BlockLazyStringDict`] that fetches
+    /// only the O(log n) dictionary blocks a binary search touches; otherwise it
+    /// loads the whole dictionary. Both yield the same id — the same in-layer
+    /// lookup, id-map `inner_to_outer`, and cumulative-offset shift.
+    ///
+    /// [`BlockLazyStringDict`]: crate::storage::block_lazy::BlockLazyStringDict
+    async fn resolve_dict_id(
+        &self,
+        chain: &[[u32; 5]],
+        offsets: &[u64],
+        kind: DictKind,
+        s: &str,
+    ) -> io::Result<Option<u64>> {
+        let ls = &self.layer_store;
+        #[cfg(feature = "object-store")]
+        let block_source = ls.block_source();
+
+        // Probe every layer at once rather than walking the chain.
+        //
+        // A string lives in exactly one layer's dictionary -- the one that
+        // introduced it, since a layer stores only its new entries -- so the
+        // search order affects only how soon it stops, never the answer. Walking
+        // head-first stops early on a hit, but each step is a round trip that
+        // cannot start until the previous one finishes, so a 12-layer chain cost
+        // up to 24 serial round trips. That is invisible at 0.5 ms against a
+        // local MinIO and about 1.5 seconds against a real object store at 60 ms.
+        //
+        // Probing concurrently costs more requests when the string sits in a
+        // recent layer, but they overlap: the query takes one round trip instead
+        // of one per layer. Given object stores rate-limit and bill per request
+        // this is a real trade, and latency is what dominates here.
+        let probes = chain.iter().enumerate().map(|(i, &layer)| {
+            #[cfg(feature = "object-store")]
+            let block_source = block_source.clone();
+            async move {
+                // Skip layers whose dictionary is empty (0 new nodes/predicates):
+                // the string can only be introduced by a layer that actually adds
+                // it. This also avoids parsing an empty dictionary's zero-filled
+                // block structure, which the block codec rejects.
+                let count = match kind {
+                    DictKind::Node => ls.get_node_count(layer).await?,
+                    DictKind::Predicate => ls.get_predicate_count(layer).await?,
+                };
+                if count.unwrap_or(0) == 0 {
+                    return Ok::<_, io::Error>(None);
+                }
+                let local: Option<u64> = {
+                    #[cfg(feature = "object-store")]
+                    {
+                        // Block-lazy fetches the offset table plus O(log n)
+                        // blocks; for a small dictionary that overhead exceeds
+                        // one whole-dict GET, so only take the block-lazy path
+                        // once the dictionary is large enough to win (measured:
+                        // it regresses below this).
+                        let use_block_lazy =
+                            count.unwrap_or(0) >= BLOCK_LAZY_MIN_ENTRIES && block_source.is_some();
+                        if let (true, Some(src)) = (use_block_lazy, &block_source) {
+                            let (off_f, blk_f) = match kind {
+                                DictKind::Node => (
+                                    crate::storage::consts::LayerFileEnum::NodeDictionaryOffsets,
+                                    crate::storage::consts::LayerFileEnum::NodeDictionaryBlocks,
+                                ),
+                                DictKind::Predicate => (
+                                    crate::storage::consts::LayerFileEnum::PredicateDictionaryOffsets,
+                                    crate::storage::consts::LayerFileEnum::PredicateDictionaryBlocks,
+                                ),
+                            };
+                            crate::storage::block_lazy::BlockLazyStringDict::open(
+                                src.clone(),
+                                layer,
+                                off_f,
+                                blk_f,
+                            )
+                            .await?
+                            .id_of_string(s)
+                            .await?
+                        } else {
+                            resolve_full(ls, kind, layer, s).await?
+                        }
+                    }
+                    #[cfg(not(feature = "object-store"))]
+                    {
+                        resolve_full(ls, kind, layer, s).await?
+                    }
+                };
+                match local {
+                    None => Ok(None),
+                    Some(local) => {
+                        let idmap = match kind {
+                            DictKind::Node => ls.get_node_value_idmap(layer).await?,
+                            DictKind::Predicate => ls.get_predicate_idmap(layer).await?,
+                        };
+                        let outer = match idmap {
+                            Some(m) => m.inner_to_outer(local),
+                            None => local,
+                        };
+                        Ok(Some((i, outer + offsets[i])))
+                    }
+                }
+            }
+        });
+        let hits = futures::future::try_join_all(probes).await?;
+        // Newest wins, matching the head-first walk this replaced.
+        Ok(hits
+            .into_iter()
+            .flatten()
+            .max_by_key(|(i, _)| *i)
+            .map(|(_, id)| id))
+    }
+
+    /// Resolve a typed value to its value-dictionary-local id in `layer` (the id
+    /// before the `+ node_dict_len` shift and id-map). Uses a block-lazy
+    /// [`BlockLazyTypedDict`] when the backend supports ranged reads and the
+    /// value dictionary is large enough to win; otherwise loads the whole value
+    /// dictionary. Both yield the same id as `TypedDict::id_entry`.
+    ///
+    /// [`BlockLazyTypedDict`]: crate::storage::block_lazy::BlockLazyTypedDict
+    async fn resolve_value_local_id(
+        &self,
+        layer: [u32; 5],
+        v: &tdb_succinct::TypedDictEntry,
+    ) -> io::Result<Option<u64>> {
+        let ls = &self.layer_store;
+        #[cfg(feature = "object-store")]
+        {
+            let count = ls.get_value_count(layer).await?.unwrap_or(0);
+            if count >= BLOCK_LAZY_MIN_ENTRIES {
+                if let Some(src) = ls.block_source() {
+                    use crate::storage::consts::LayerFileEnum;
+                    let d = crate::storage::block_lazy::BlockLazyTypedDict::open(
+                        src,
+                        layer,
+                        LayerFileEnum::ValueDictionaryTypesPresent,
+                        LayerFileEnum::ValueDictionaryTypeOffsets,
+                        LayerFileEnum::ValueDictionaryOffsets,
+                        LayerFileEnum::ValueDictionaryBlocks,
+                    )
+                    .await?;
+                    return d.id_of_entry(v).await;
+                }
+            }
+        }
+        Ok(ls
+            .get_value_dictionary(layer)
+            .await?
+            .and_then(|vd| vd.id_entry(v).into_option()))
+    }
+
+    /// Whether the id-triple exists in one signed adjacency index (additions or
+    /// removals) of `layer`, using block-lazy reads: the two bit indexes are
+    /// small and loaded whole, while the large `nums` arrays are read one element
+    /// at a time via [`BlockLazyLogArray`]. Mirrors `layer_triple_exists` /
+    /// `sp_o_position` exactly. Returns `false` if the index is absent (e.g. a
+    /// base layer has no removals).
+    ///
+    /// [`BlockLazyLogArray`]: crate::storage::block_lazy::BlockLazyLogArray
+    #[cfg(feature = "object-store")]
+    async fn block_lazy_sign_exists(
+        &self,
+        src: &std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>,
+        layer: [u32; 5],
+        files: &AdjFiles,
+        triple: IdTriple,
+    ) -> io::Result<bool> {
+        use crate::storage::block_lazy::BlockLazyLogArray;
+        use tdb_succinct::{BitIndex, MonotonicLogArray};
+
+        let (subject, predicate, object) = (triple.subject, triple.predicate, triple.object);
+        if subject == 0 || predicate == 0 || object == 0 {
+            return Ok(false);
+        }
+
+        // Load a bit index whole (bits + rank/select samples are small); its
+        // three structures are independent, so fetch them concurrently. Absence
+        // of the bits structure means this signed index does not exist here.
+        async fn bit_index(
+            src: &std::sync::Arc<dyn crate::storage::block_lazy::BlockSource>,
+            layer: [u32; 5],
+            bits: crate::storage::consts::LayerFileEnum,
+            blocks: crate::storage::consts::LayerFileEnum,
+            sblocks: crate::storage::consts::LayerFileEnum,
+        ) -> io::Result<Option<BitIndex>> {
+            let (bits, blocks, sblocks) = futures::try_join!(
+                src.structure_bytes(layer, bits),
+                src.structure_bytes(layer, blocks),
+                src.structure_bytes(layer, sblocks),
+            )?;
+            let bits = match bits {
+                Some(b) if !b.is_empty() => b,
+                _ => return Ok(None),
+            };
+            Ok(Some(BitIndex::from_maps(
+                bits,
+                blocks.unwrap_or_default(),
+                sblocks.unwrap_or_default(),
+            )))
+        }
+
+        let subjects_fut = async {
+            // Optional subject id-map (present on child layers; absent on base,
+            // where the subject id is used directly).
+            Ok::<Option<MonotonicLogArray>, io::Error>(
+                match src.structure_bytes(layer, files.subjects).await? {
+                    Some(b) if !b.is_empty() => Some(MonotonicLogArray::parse(b).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("subjects: {:?}", e))
+                    })?),
+                    _ => None,
+                },
+            )
+        };
+
+        // All the setup reads for this signed index are independent — fetch the
+        // two bit indexes, the two nums openers, and the subjects array in one
+        // concurrent wave rather than sequentially.
+        let (sp_bits_opt, spo_bits_opt, sp_nums, spo_nums, subjects) = futures::try_join!(
+            bit_index(src, layer, files.sp_bits, files.sp_blocks, files.sp_sblocks),
+            bit_index(
+                src,
+                layer,
+                files.spo_bits,
+                files.spo_blocks,
+                files.spo_sblocks
+            ),
+            BlockLazyLogArray::open(src.clone(), layer, files.sp_nums),
+            BlockLazyLogArray::open(src.clone(), layer, files.spo_nums),
+            subjects_fut,
+        )?;
+        let sp_bits = match sp_bits_opt {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+        let spo_bits = match spo_bits_opt {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+
+        // `AdjacencyList::offset_for(index)`.
+        let offset_for = |bits: &BitIndex, index: u64| -> u64 {
+            if index == 1 {
+                0
+            } else {
+                bits.select1(index - 1).unwrap() + 1
+            }
+        };
+
+        // Locate the subject's row in the s→p list (mirrors `sp_o_position`).
+        let s_position = match &subjects {
+            None => {
+                let left_count = if sp_bits.len() == 0 {
+                    0
+                } else {
+                    sp_bits.rank1(sp_bits.len() as u64 - 1)
+                };
+                if subject > left_count {
+                    return Ok(false);
+                }
+                subject - 1
+            }
+            Some(subjects) => match subjects.index_of(subject) {
+                Some(pos) => pos as u64,
+                None => return Ok(false),
+            },
+        };
+
+        let mut sp_pos = offset_for(&sp_bits, s_position + 1);
+        loop {
+            let bit = sp_bits.get(sp_pos);
+            if sp_nums.entry(sp_pos as usize).await? == predicate {
+                break;
+            }
+            if bit {
+                return Ok(false); // past this subject's predicates
+            }
+            sp_pos += 1;
+        }
+
+        // Scan the (s,p) row of the (s,p)→o list for the object.
+        let mut spo_pos = offset_for(&spo_bits, sp_pos + 1);
+        loop {
+            let bit = spo_bits.get(spo_pos);
+            if spo_nums.entry(spo_pos as usize).await? == object {
+                return Ok(true);
+            }
+            if bit {
+                break; // past this (s,p) pair's objects
+            }
+            spo_pos += 1;
+        }
+        Ok(false)
+    }
+
+    /// Like [`selective_id_triple_exists`](Self::selective_id_triple_exists) but
+    /// for a *string* triple: resolves the subject/predicate/object to ids by
+    /// loading only the dictionaries and id-maps of the layers in the chain
+    /// (never the adjacency-only structures are enough for the final existence
+    /// walk). Nothing else is materialized, so on a disk-less replica this
+    /// fetches only dictionaries + id-maps + adjacency — not object indexes or
+    /// wavelet trees. Returns `false` if any string is absent from the graph.
+    ///
+    /// Mirrors `InternalLayer`'s resolution exactly (per-layer dict lookup, the
+    /// layer's id-map `inner_to_outer`, the `+ node_dict_len` shift for values,
+    /// and the cumulative parent count as the global offset), verified against
+    /// the fully-materialized layer by a differential test. (Phase 3, Stage 1b.)
+    pub async fn selective_value_triple_exists(
+        &self,
+        head: [u32; 5],
+        triple: &ValueTriple,
+    ) -> io::Result<bool> {
+        // chain is base-first; compute the cumulative node+value and predicate
+        // counts *below* each layer (the global-id offset for entries it owns).
+        // The per-layer counts are independent, so fetch them all concurrently.
+        let chain = self.read_chain(head).await?;
+        let ls = &self.layer_store;
+        let counts = futures::future::try_join_all(chain.iter().map(|&layer| async move {
+            let (n, v, p) = futures::try_join!(
+                ls.get_node_count(layer),
+                ls.get_value_count(layer),
+                ls.get_predicate_count(layer),
+            )?;
+            Ok::<_, io::Error>((n.unwrap_or(0) + v.unwrap_or(0), p.unwrap_or(0)))
+        }))
+        .await?;
+        let mut off_nv = Vec::with_capacity(chain.len());
+        let mut off_pred = Vec::with_capacity(chain.len());
+        let (mut cum_nv, mut cum_pred) = (0u64, 0u64);
+        for (nv, pred) in counts {
+            off_nv.push(cum_nv);
+            off_pred.push(cum_pred);
+            cum_nv += nv;
+            cum_pred += pred;
+        }
+
+        // Subject, predicate and object resolve independently — walk their three
+        // chains concurrently. `resolve_dict_id` uses block-lazy dictionaries when
+        // the backend supports ranged reads, otherwise the whole-dictionary path.
+        let (subject, predicate, object) = futures::try_join!(
+            self.resolve_dict_id(&chain, &off_nv, DictKind::Node, &triple.subject),
+            self.resolve_dict_id(&chain, &off_pred, DictKind::Predicate, &triple.predicate),
+            self.resolve_object_id(&chain, &off_nv, &triple.object),
+        )?;
+        let (subject, predicate, object) = match (subject, predicate, object) {
+            (Some(s), Some(p), Some(o)) => (s, p, o),
+            _ => return Ok(false),
+        };
+
+        self.selective_id_triple_exists(head, IdTriple::new(subject, predicate, object))
+            .await
+    }
+
+    /// Compute, disk-lessly, the per-layer id-offset context a reverse (id →
+    /// string) resolution needs: the chain (base-first), the cumulative node+value
+    /// offset below each layer, each layer's node count (to split node vs value),
+    /// the cumulative predicate offset, and each layer's predicate count. Counts
+    /// are fetched concurrently.
+    /// The layers to read to answer a whole-graph query at `head`.
+    ///
+    /// A rollup collapses `head`'s ancestor chain into one base layer with the
+    /// same ids (verified by `disk_less_reads_agree_with_materialized_after_rollup`),
+    /// so a rolled-up graph reads as a single-layer chain — the difference
+    /// between ~2 requests per ancestor and a handful total. On absence, the
+    /// authoritative chain.
+    ///
+    /// Only whole-graph reads (existence, resolution, scan, the counts that
+    /// describe the id space) may use this. The **delta** queries must not: they
+    /// report what an individual layer changed, which a rollup does not preserve,
+    /// so they keep the real per-layer chain via `retrieve_layer_stack_names`.
+    async fn read_chain(&self, head: [u32; 5]) -> io::Result<Vec<[u32; 5]>> {
+        if let Some(rollup) = self.layer_store.read_rollup(head).await? {
+            return Ok(vec![rollup]);
+        }
+        self.layer_store.retrieve_layer_stack_names(head).await
+    }
+
+    async fn chain_offsets(
+        &self,
+        head: [u32; 5],
+    ) -> io::Result<(Vec<[u32; 5]>, Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>)> {
+        let chain = self.read_chain(head).await?;
+        let ls = &self.layer_store;
+        let counts = futures::future::try_join_all(chain.iter().map(|&layer| async move {
+            let (n, v, p) = futures::try_join!(
+                ls.get_node_count(layer),
+                ls.get_value_count(layer),
+                ls.get_predicate_count(layer),
+            )?;
+            Ok::<_, io::Error>((n.unwrap_or(0), v.unwrap_or(0), p.unwrap_or(0)))
+        }))
+        .await?;
+        let (mut off_nv, mut node_counts, mut off_pred, mut pred_counts) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut cum_nv, mut cum_pred) = (0u64, 0u64);
+        for (n, v, p) in counts {
+            off_nv.push(cum_nv);
+            node_counts.push(n);
+            off_pred.push(cum_pred);
+            pred_counts.push(p);
+            cum_nv += n + v;
+            cum_pred += p;
+        }
+        Ok((chain, off_nv, node_counts, off_pred, pred_counts))
+    }
+
+    /// Locate the owning layer and in-layer (id-map inner) id for a global
+    /// node/value id — the reverse of the `+ off_nv` and `inner_to_outer` used on
+    /// the forward path. Mirrors `InternalLayer::id_subject`/`id_object`.
+    async fn locate_nv(
+        &self,
+        chain: &[[u32; 5]],
+        off_nv: &[u64],
+        id: u64,
+    ) -> io::Result<Option<(usize, u64)>> {
+        let ls = &self.layer_store;
+        for i in (0..chain.len()).rev() {
+            if id > off_nv[i] {
+                let outer = id - off_nv[i];
+                let inner = match ls.get_node_value_idmap(chain[i]).await? {
+                    Some(m) => m.outer_to_inner(outer),
+                    None => outer,
+                };
+                return Ok(Some((i, inner)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The node string for an in-layer (1-based) node id, block-lazy when the
+    /// backend supports ranged reads and the dictionary is large enough.
+    async fn id_to_node_string(
+        &self,
+        layer: [u32; 5],
+        inner: u64,
+        count: u64,
+    ) -> io::Result<Option<String>> {
+        let ls = &self.layer_store;
+        #[cfg(feature = "object-store")]
+        {
+            if count >= BLOCK_LAZY_MIN_ENTRIES {
+                if let Some(src) = ls.block_source() {
+                    use crate::storage::consts::LayerFileEnum;
+                    let d = crate::storage::block_lazy::BlockLazyStringDict::open(
+                        src,
+                        layer,
+                        LayerFileEnum::NodeDictionaryOffsets,
+                        LayerFileEnum::NodeDictionaryBlocks,
+                    )
+                    .await?;
+                    return d.get_string(inner).await;
+                }
+            }
+        }
+        let _ = count;
+        Ok(ls
+            .get_node_dictionary(layer)
+            .await?
+            .and_then(|d| d.get(inner as usize)))
+    }
+
+    /// The typed value for an in-layer (1-based) value id, block-lazy when the
+    /// backend supports ranged reads and the dictionary is large enough.
+    async fn id_to_value(
+        &self,
+        layer: [u32; 5],
+        value_inner: u64,
+        count: u64,
+    ) -> io::Result<Option<tdb_succinct::TypedDictEntry>> {
+        let ls = &self.layer_store;
+        #[cfg(feature = "object-store")]
+        {
+            if count >= BLOCK_LAZY_MIN_ENTRIES {
+                if let Some(src) = ls.block_source() {
+                    use crate::storage::consts::LayerFileEnum;
+                    let d = crate::storage::block_lazy::BlockLazyTypedDict::open(
+                        src,
+                        layer,
+                        LayerFileEnum::ValueDictionaryTypesPresent,
+                        LayerFileEnum::ValueDictionaryTypeOffsets,
+                        LayerFileEnum::ValueDictionaryOffsets,
+                        LayerFileEnum::ValueDictionaryBlocks,
+                    )
+                    .await?;
+                    return d.entry(value_inner).await;
+                }
+            }
+        }
+        let _ = count;
+        Ok(ls
+            .get_value_dictionary(layer)
+            .await?
+            .and_then(|d| d.entry(value_inner as usize)))
+    }
+
+    /// The subject string for a global id, resolved disk-lessly. Mirrors
+    /// `Layer::id_subject`. (Phase 3, Stage 4: reverse resolution.)
+    pub async fn selective_id_subject(
+        &self,
+        head: [u32; 5],
+        id: u64,
+    ) -> io::Result<Option<String>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        let (chain, off_nv, node_counts, _, _) = self.chain_offsets(head).await?;
+        match self.locate_nv(&chain, &off_nv, id).await? {
+            Some((i, inner)) => {
+                self.id_to_node_string(chain[i], inner, node_counts[i])
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The predicate string for a global id, resolved disk-lessly. Mirrors
+    /// `Layer::id_predicate`.
+    pub async fn selective_id_predicate(
+        &self,
+        head: [u32; 5],
+        id: u64,
+    ) -> io::Result<Option<String>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        let ls = &self.layer_store;
+        let (chain, _, _, off_pred, pred_counts) = self.chain_offsets(head).await?;
+        for i in (0..chain.len()).rev() {
+            if id > off_pred[i] {
+                let outer = id - off_pred[i];
+                let inner = match ls.get_predicate_idmap(chain[i]).await? {
+                    Some(m) => m.outer_to_inner(outer),
+                    None => outer,
+                };
+                // predicate dictionary reuses the node-string block-lazy path.
+                return self
+                    .id_to_pred_string(chain[i], inner, pred_counts[i])
+                    .await;
+            }
+        }
+        Ok(None)
+    }
+
+    async fn id_to_pred_string(
+        &self,
+        layer: [u32; 5],
+        inner: u64,
+        count: u64,
+    ) -> io::Result<Option<String>> {
+        let ls = &self.layer_store;
+        #[cfg(feature = "object-store")]
+        {
+            if count >= BLOCK_LAZY_MIN_ENTRIES {
+                if let Some(src) = ls.block_source() {
+                    use crate::storage::consts::LayerFileEnum;
+                    let d = crate::storage::block_lazy::BlockLazyStringDict::open(
+                        src,
+                        layer,
+                        LayerFileEnum::PredicateDictionaryOffsets,
+                        LayerFileEnum::PredicateDictionaryBlocks,
+                    )
+                    .await?;
+                    return d.get_string(inner).await;
+                }
+            }
+        }
+        let _ = count;
+        Ok(ls
+            .get_predicate_dictionary(layer)
+            .await?
+            .and_then(|d| d.get(inner as usize)))
+    }
+
+    /// The object (node or typed value) for a global id, resolved disk-lessly.
+    /// Mirrors `Layer::id_object`.
+    pub async fn selective_id_object(
+        &self,
+        head: [u32; 5],
+        id: u64,
+    ) -> io::Result<Option<ObjectType>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        let (chain, off_nv, node_counts, _, _) = self.chain_offsets(head).await?;
+        match self.locate_nv(&chain, &off_nv, id).await? {
+            Some((i, inner)) => {
+                let node_len = node_counts[i];
+                if inner > node_len {
+                    // above the node range in this layer -> a value
+                    Ok(self
+                        .id_to_value(chain[i], inner - node_len, node_counts[i])
+                        .await?
+                        .map(ObjectType::Value))
+                } else {
+                    Ok(self
+                        .id_to_node_string(chain[i], inner, node_len)
+                        .await?
+                        .map(ObjectType::Node))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve a whole id-triple back to its string form, disk-lessly. Mirrors
+    /// `Layer::id_triple_to_string`.
+    pub async fn selective_id_triple_to_string(
+        &self,
+        head: [u32; 5],
+        triple: IdTriple,
+    ) -> io::Result<Option<ValueTriple>> {
+        let (s, p, o) = futures::try_join!(
+            self.selective_id_subject(head, triple.subject),
+            self.selective_id_predicate(head, triple.predicate),
+            self.selective_id_object(head, triple.object),
+        )?;
+        Ok(match (s, p, o) {
+            (Some(s), Some(p), Some(o)) => Some(ValueTriple {
+                subject: s,
+                predicate: p,
+                object: o,
+            }),
+            _ => None,
+        })
+    }
+
+    /// The global id of a subject string, resolved disk-lessly. Mirrors
+    /// `Layer::subject_id`. (Phase 3, Stage 4: forward resolution, public.)
+    pub async fn selective_subject_id(
+        &self,
+        head: [u32; 5],
+        subject: &str,
+    ) -> io::Result<Option<u64>> {
+        let (chain, off_nv, _, _, _) = self.chain_offsets(head).await?;
+        self.resolve_dict_id(&chain, &off_nv, DictKind::Node, subject)
+            .await
+    }
+
+    /// The global id of a predicate string. Mirrors `Layer::predicate_id`.
+    pub async fn selective_predicate_id(
+        &self,
+        head: [u32; 5],
+        predicate: &str,
+    ) -> io::Result<Option<u64>> {
+        let (chain, _, _, off_pred, _) = self.chain_offsets(head).await?;
+        self.resolve_dict_id(&chain, &off_pred, DictKind::Predicate, predicate)
+            .await
+    }
+
+    /// The global id of a triple object (node or typed value). Mirrors
+    /// `Layer::object_node_id` / `object_value_id`.
+    pub async fn selective_object_id(
+        &self,
+        head: [u32; 5],
+        object: &ObjectType,
+    ) -> io::Result<Option<u64>> {
+        let (chain, off_nv, _, _, _) = self.chain_offsets(head).await?;
+        self.resolve_object_id(&chain, &off_nv, object).await
+    }
+
+    /// Resolve a whole string triple to ids, disk-lessly (the three components
+    /// concurrently). Mirrors `Layer::value_triple_to_id`.
+    pub async fn selective_value_triple_to_id(
+        &self,
+        head: [u32; 5],
+        triple: &ValueTriple,
+    ) -> io::Result<Option<IdTriple>> {
+        let (chain, off_nv, _, off_pred, _) = self.chain_offsets(head).await?;
+        let (s, p, o) = futures::try_join!(
+            self.resolve_dict_id(&chain, &off_nv, DictKind::Node, &triple.subject),
+            self.resolve_dict_id(&chain, &off_pred, DictKind::Predicate, &triple.predicate),
+            self.resolve_object_id(&chain, &off_nv, &triple.object),
+        )?;
+        Ok(match (s, p, o) {
+            (Some(s), Some(p), Some(o)) => Some(IdTriple::new(s, p, o)),
+            _ => None,
+        })
+    }
+
+    /// A disk-less full scan of the graph headed by `head`: every id-triple, in
+    /// sorted order, reconciled across the layer chain (newest layer wins).
+    ///
+    /// It loads only each layer's **adjacency** (via ranged reads on an object
+    /// backend — no local disk, and none of the dictionaries, object indexes or
+    /// wavelet trees a `get_layer` would materialize), then merge-streams the
+    /// output lazily: the returned iterator yields one triple at a time using the
+    /// exact stack reconciliation of `Layer::triples`, so only the merge frontier
+    /// is added on top of the resident adjacency. The per-layer adjacency loads
+    /// run concurrently.
+    ///
+    /// Mirrors `Layer::triples`. (Phase 3, Stage 5: disk-less scan.)
+    pub async fn selective_id_triples(
+        &self,
+        head: [u32; 5],
+    ) -> io::Result<crate::layer::InternalTripleSubjectIterator> {
+        let chain = self.read_chain(head).await?;
+        let ls = &self.layer_store;
+        // Fetch every layer's addition and removal iterators concurrently,
+        // head-first (index 0 = most recent, as the reconciliation requires).
+        let per_layer =
+            futures::future::try_join_all(chain.iter().rev().map(|&layer| async move {
+                let (adds, rems) =
+                    futures::try_join!(ls.triple_additions(layer), ls.triple_removals(layer))?;
+                Ok::<_, io::Error>((adds, rems))
+            }))
+            .await?;
+        let (mut positives, mut negatives) = (
+            Vec::with_capacity(per_layer.len()),
+            Vec::with_capacity(per_layer.len()),
+        );
+        for (adds, rems) in per_layer {
+            positives.push(adds);
+            negatives.push(rems);
+        }
+        Ok(crate::layer::InternalTripleSubjectIterator::from_iterators(
+            positives, negatives,
+        ))
+    }
+
+    /// A disk-less query handle over the graph headed by `head`: the common
+    /// read operations without ever materializing a whole layer. See
+    /// [`LazyLayer`].
+    pub fn lazy_layer(&self, head: [u32; 5]) -> LazyLayer {
+        LazyLayer {
+            store: self.clone(),
+            head,
+        }
+    }
+
+    /// The rollup registered for `head`, if any — i.e. whether background
+    /// compaction has flattened this head. `None` means it has not been rolled
+    /// up. Useful for monitoring a compaction policy.
+    pub async fn rollup_of(&self, head: [u32; 5]) -> io::Result<Option<[u32; 5]>> {
+        self.layer_store.read_rollup(head).await
+    }
+
+    /// Whether a layer exists, without materializing it. Pairs with
+    /// [`lazy_layer`](Self::lazy_layer), which hands out a handle for any name
+    /// and so cannot itself report that the layer is unknown.
+    pub async fn layer_exists(&self, layer: [u32; 5]) -> io::Result<bool> {
+        self.layer_store.layer_exists(layer).await
+    }
+
+    /// Resolve a triple object (node or typed value) to its global id, walking
+    /// the chain head-first. See [`resolve_dict_id`](Self::resolve_dict_id) and
+    /// [`resolve_value_local_id`](Self::resolve_value_local_id).
+    async fn resolve_object_id(
+        &self,
+        chain: &[[u32; 5]],
+        off_nv: &[u64],
+        object: &ObjectType,
+    ) -> io::Result<Option<u64>> {
+        match object {
+            ObjectType::Node(n) => self.resolve_dict_id(chain, off_nv, DictKind::Node, n).await,
+            ObjectType::Value(v) => {
+                let ls = &self.layer_store;
+                for i in (0..chain.len()).rev() {
+                    if let Some(local) = self.resolve_value_local_id(chain[i], v).await? {
+                        // values live above this layer's nodes in the id-map's
+                        // input space, hence the `+ node_dict_len` shift.
+                        let node_len = ls.get_node_count(chain[i]).await?.unwrap_or(0);
+                        let combined = local + node_len;
+                        let outer = match ls.get_node_value_idmap(chain[i]).await? {
+                            Some(m) => m.inner_to_outer(combined),
+                            None => combined,
+                        };
+                        return Ok(Some(outer + off_nv[i]));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// All id-triples with subject `subject` in the graph headed by `head`,
+    /// loading only the adjacency structures of each layer (the disk-less
+    /// traversal path). See [`selective_id_triple_exists`](Self::selective_id_triple_exists)
+    /// for the correctness rationale. (Phase 3, Stage 1c.)
+    pub async fn selective_id_triples_s(
+        &self,
+        head: [u32; 5],
+        subject: u64,
+    ) -> io::Result<Vec<IdTriple>> {
+        let chain = self.read_chain(head).await?;
+        let mut per_layer = Vec::with_capacity(chain.len());
+        for &layer in chain.iter().rev() {
+            let adds = self.layer_store.triple_additions_s(layer, subject).await?;
+            let removes = self.layer_store.triple_removals_s(layer, subject).await?;
+            per_layer.push((adds.collect(), removes.collect()));
+        }
+        Ok(reconcile_layered(per_layer))
+    }
+
+    /// All id-triples with subject `subject` and predicate `predicate`.
+    pub async fn selective_id_triples_sp(
+        &self,
+        head: [u32; 5],
+        subject: u64,
+        predicate: u64,
+    ) -> io::Result<Vec<IdTriple>> {
+        let chain = self.read_chain(head).await?;
+        let mut per_layer = Vec::with_capacity(chain.len());
+        for &layer in chain.iter().rev() {
+            let adds = self
+                .layer_store
+                .triple_additions_sp(layer, subject, predicate)
+                .await?;
+            let removes = self
+                .layer_store
+                .triple_removals_sp(layer, subject, predicate)
+                .await?;
+            per_layer.push((adds.collect(), removes.collect()));
+        }
+        Ok(reconcile_layered(per_layer))
+    }
+
+    /// All id-triples with predicate `predicate`.
+    pub async fn selective_id_triples_p(
+        &self,
+        head: [u32; 5],
+        predicate: u64,
+    ) -> io::Result<Vec<IdTriple>> {
+        let chain = self.read_chain(head).await?;
+        let mut per_layer = Vec::with_capacity(chain.len());
+        for &layer in chain.iter().rev() {
+            let adds = self
+                .layer_store
+                .triple_additions_p(layer, predicate)
+                .await?;
+            let removes = self.layer_store.triple_removals_p(layer, predicate).await?;
+            per_layer.push((adds.collect(), removes.collect()));
+        }
+        Ok(reconcile_layered(per_layer))
+    }
+
+    /// All id-triples with object `object`.
+    ///
+    /// The per-layer object iterator seeks to the *nearest* object when the
+    /// queried one is absent from a layer, and the cached path does not apply
+    /// the exact-match filter the file path does, so we filter to the exact
+    /// object here before reconciling.
+    pub async fn selective_id_triples_o(
+        &self,
+        head: [u32; 5],
+        object: u64,
+    ) -> io::Result<Vec<IdTriple>> {
+        let chain = self.read_chain(head).await?;
+        let mut per_layer = Vec::with_capacity(chain.len());
+        for &layer in chain.iter().rev() {
+            let adds: Vec<IdTriple> = self
+                .layer_store
+                .triple_additions_o(layer, object)
+                .await?
+                .filter(|t| t.object == object)
+                .collect();
+            let removes: Vec<IdTriple> = self
+                .layer_store
+                .triple_removals_o(layer, object)
+                .await?
+                .filter(|t| t.object == object)
+                .collect();
+            per_layer.push((adds, removes));
+        }
+        Ok(reconcile_layered(per_layer))
+    }
+
+    /// The object ids in `head`'s chain whose value falls in `[low, high)`, in
+    /// ascending order, and the disk-less triples that use them.
+    ///
+    /// Mirrors `InternalLayer::triples_value_range`: for each layer in the
+    /// chain, binary-search the two bounds in that layer's value dictionary,
+    /// walk the ids between them, and map each through the layer's id map and
+    /// cumulative offset into the global id space. Only the touched dictionary
+    /// blocks are fetched, so the cost scales with the width of the range rather
+    /// than the size of the dictionary.
+    ///
+    /// `rev` yields descending object order.
+    pub async fn selective_id_triples_value_range(
+        &self,
+        head: [u32; 5],
+        low: &tdb_succinct::TypedDictEntry,
+        high: &tdb_succinct::TypedDictEntry,
+        rev: bool,
+    ) -> io::Result<Vec<IdTriple>> {
+        // Both bounds must name the same datatype segment; mismatched bounds
+        // describe no range at all rather than an error.
+        if low.datatype() != high.datatype() {
+            return Ok(Vec::new());
+        }
+
+        let (chain, off_nv, node_counts, _, _) = self.chain_offsets(head).await?;
+        let ls = &self.layer_store;
+        let mut object_ids: Vec<u64> = Vec::new();
+
+        for (i, &layer) in chain.iter().enumerate() {
+            let bounds = self.value_range_bounds(layer, low, high).await?;
+            let (start, end) = match bounds {
+                Some(b) => b,
+                // this layer's value dictionary has no segment for the datatype
+                None => continue,
+            };
+            if start >= end {
+                continue;
+            }
+            let idmap = ls.get_node_value_idmap(layer).await?;
+            for pos in start..end {
+                // value ids sit above the node ids within a layer, then go
+                // through the id map and the chain's cumulative offset
+                let inner = pos + node_counts[i];
+                let outer = match &idmap {
+                    Some(m) => m.inner_to_outer(inner),
+                    None => inner,
+                };
+                object_ids.push(outer + off_nv[i]);
+            }
+        }
+
+        // Object ids are dictionary-ordered within a layer but not across the
+        // chain, so sort to get a single ascending pass over the range.
+        object_ids.sort_unstable();
+        object_ids.dedup();
+        if rev {
+            object_ids.reverse();
+        }
+
+        let mut out = Vec::new();
+        for oid in object_ids {
+            out.extend(self.selective_id_triples_o(head, oid).await?);
+        }
+        Ok(out)
+    }
+
+    /// The half-open value-dictionary-local id range `[start, end)` covering
+    /// `[low, high)` in one layer's value dictionary, or `None` if that
+    /// dictionary has no segment for the bounds' datatype.
+    async fn value_range_bounds(
+        &self,
+        layer: [u32; 5],
+        low: &tdb_succinct::TypedDictEntry,
+        high: &tdb_succinct::TypedDictEntry,
+    ) -> io::Result<Option<(u64, u64)>> {
+        use tdb_succinct::block::IdLookupResult;
+        // `Closest(i)` means the bound sorts just after id `i`, so the range
+        // starts at `i + 1`; `NotFound` means it sorts before the whole
+        // segment, so the range starts at the segment's first id.
+        let resolve = |r: IdLookupResult, id_offset: u64| match r {
+            IdLookupResult::Found(i) => i,
+            IdLookupResult::Closest(i) => i + 1,
+            IdLookupResult::NotFound => id_offset + 1,
+        };
+
+        #[cfg(feature = "object-store")]
+        {
+            let count = self.layer_store.get_value_count(layer).await?.unwrap_or(0);
+            if count >= BLOCK_LAZY_MIN_ENTRIES {
+                if let Some(src) = self.layer_store.block_source() {
+                    use crate::storage::consts::LayerFileEnum;
+                    let d = crate::storage::block_lazy::BlockLazyTypedDict::open(
+                        src,
+                        layer,
+                        LayerFileEnum::ValueDictionaryTypesPresent,
+                        LayerFileEnum::ValueDictionaryTypeOffsets,
+                        LayerFileEnum::ValueDictionaryOffsets,
+                        LayerFileEnum::ValueDictionaryBlocks,
+                    )
+                    .await?;
+                    let (lo, id_offset) = match d.lookup_entry(low).await? {
+                        Some(v) => v,
+                        None => return Ok(None),
+                    };
+                    let (hi, _) = match d.lookup_entry(high).await? {
+                        Some(v) => v,
+                        None => return Ok(None),
+                    };
+                    return Ok(Some((resolve(lo, id_offset), resolve(hi, id_offset))));
+                }
+            }
+        }
+
+        let dict = match self.layer_store.get_value_dictionary(layer).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let id_offset = match dict.type_segment(low.datatype()) {
+            Some((_, offset)) => offset,
+            None => return Ok(None),
+        };
+        Ok(Some((
+            resolve(dict.id_entry(low), id_offset),
+            resolve(dict.id_entry(high), id_offset),
+        )))
+    }
+
+    /// Spawn a background task that keeps read depth bounded: every `interval`
+    /// it rolls up (non-destructively) any label head whose effective layer
+    /// stack exceeds `max_depth`. Returns the task handle; abort it to stop.
+    ///
+    /// Rollup-only, never squash — every original layer is retained and the
+    /// content-addressed parent chain stays walkable, so immutability and the
+    /// per-commit audit trail are preserved.
+    pub fn spawn_compaction(
+        &self,
+        max_depth: usize,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        compaction::CompactionManager::new(self.clone(), max_depth).spawn(interval)
     }
 
     /// Create a base layer builder, unattached to any database label.
@@ -968,6 +2173,377 @@ impl Store {
     }
 }
 
+/// A disk-less, async query handle over the graph headed by one layer.
+///
+/// It answers the common read operations -- existence, traversal, and
+/// string/id resolution in both directions -- by routing through the selective,
+/// block-lazy primitives on [`Store`], **without ever materializing a whole
+/// layer**. On an object-store backend with no local disk it fetches only the
+/// blocks a query touches; on other backends it falls back to whole structures.
+/// It is the disk-less analogue of a materialized [`StoreLayer`] for the
+/// point/traversal query classes.
+///
+/// Obtain one with [`Store::lazy_layer`]. Every method mirrors the like-named
+/// method on the [`Layer`](crate::layer::Layer) trait, made asynchronous.
+#[derive(Clone)]
+pub struct LazyLayer {
+    store: Store,
+    head: [u32; 5],
+}
+
+impl LazyLayer {
+    /// The head layer id this handle reads.
+    pub fn name(&self) -> [u32; 5] {
+        self.head
+    }
+
+    // ---- chain metadata ----
+
+    /// The size of the node/value id space, i.e. the cumulative node + value
+    /// count over the whole ancestor chain, as [`Layer::node_and_value_count`]
+    /// reports it. Reads only the per-layer counts -- immutable, and cached by
+    /// `CachedLayerStore` -- never a dictionary.
+    pub async fn node_and_value_count(&self) -> io::Result<u64> {
+        let (nodes, values, _) = self.chain_count_totals().await?;
+        Ok(nodes + values)
+    }
+
+    /// The size of the predicate id space over the whole ancestor chain, as
+    /// [`Layer::predicate_count`] reports it.
+    pub async fn predicate_count(&self) -> io::Result<u64> {
+        Ok(self.chain_count_totals().await?.2)
+    }
+
+    /// Cumulative (nodes, values, predicates) over the whole ancestor chain.
+    /// The per-layer counts are fetched concurrently.
+    async fn chain_count_totals(&self) -> io::Result<(u64, u64, u64)> {
+        // The id-space size is identical read through a rollup, and cheaper.
+        let chain = self.store.read_chain(self.head).await?;
+        let ls = &self.store.layer_store;
+        let per_layer = futures::future::try_join_all(chain.into_iter().map(|layer| async move {
+            let (n, v, p) = futures::try_join!(
+                ls.get_node_count(layer),
+                ls.get_value_count(layer),
+                ls.get_predicate_count(layer),
+            )?;
+            Ok::<_, io::Error>((n.unwrap_or(0), v.unwrap_or(0), p.unwrap_or(0)))
+        }))
+        .await?;
+        Ok(per_layer
+            .into_iter()
+            .fold((0, 0, 0), |(an, av, ap), (n, v, p)| {
+                (an + n, av + v, ap + p)
+            }))
+    }
+
+    /// This layer's parent, if it has one.
+    pub async fn parent_name(&self) -> io::Result<Option<[u32; 5]>> {
+        self.store
+            .layer_store
+            .get_layer_parent_name(self.head)
+            .await
+    }
+
+    /// Materialize this layer.
+    ///
+    /// This is the escape hatch for operations that inherently need a whole
+    /// layer -- building a child on top of it, squashing, rolling up -- and it
+    /// costs exactly what the disk-less path otherwise avoids. Reads should
+    /// never need it.
+    pub async fn materialize(&self) -> io::Result<Option<StoreLayer>> {
+        self.store.get_layer_from_id(self.head).await
+    }
+
+    /// This layer's own addition count -- not the chain's. One metadata read.
+    pub async fn triple_layer_addition_count(&self) -> io::Result<usize> {
+        self.store
+            .layer_store
+            .triple_layer_addition_count(self.head)
+            .await
+    }
+
+    /// This layer's own removal count -- not the chain's. One metadata read.
+    pub async fn triple_layer_removal_count(&self) -> io::Result<usize> {
+        self.store
+            .layer_store
+            .triple_layer_removal_count(self.head)
+            .await
+    }
+
+    /// Additions across the whole chain, as [`Layer::triple_addition_count`]
+    /// reports it. Sums the per-layer counts concurrently rather than
+    /// materializing anything.
+    pub async fn triple_addition_count(&self) -> io::Result<usize> {
+        Ok(self.chain_triple_counts().await?.0)
+    }
+
+    /// Removals across the whole chain, as [`Layer::triple_removal_count`]
+    /// reports it.
+    pub async fn triple_removal_count(&self) -> io::Result<usize> {
+        Ok(self.chain_triple_counts().await?.1)
+    }
+
+    /// Triples across the whole chain: additions minus removals, matching
+    /// [`Layer::triple_count`].
+    pub async fn triple_count(&self) -> io::Result<usize> {
+        let (adds, removes) = self.chain_triple_counts().await?;
+        Ok(adds - removes)
+    }
+
+    async fn chain_triple_counts(&self) -> io::Result<(usize, usize)> {
+        // Through a rollup this is one base layer: all triples as additions,
+        // none as removals, so additions - removals is the same net count as
+        // reconciling the real chain, and far cheaper.
+        let chain = self.store.read_chain(self.head).await?;
+        let ls = &self.store.layer_store;
+        let per_layer = futures::future::try_join_all(chain.into_iter().map(|layer| async move {
+            futures::try_join!(
+                ls.triple_layer_addition_count(layer),
+                ls.triple_layer_removal_count(layer),
+            )
+        }))
+        .await?;
+        Ok(per_layer
+            .into_iter()
+            .fold((0, 0), |(aa, ar), (a, r)| (aa + a, ar + r)))
+    }
+
+    /// This layer's parent as another disk-less handle, if it has one.
+    pub async fn parent(&self) -> io::Result<Option<LazyLayer>> {
+        Ok(self.parent_name().await?.map(|p| self.store.lazy_layer(p)))
+    }
+
+    /// The whole ancestor chain, head first — the same order
+    /// [`LayerStore::retrieve_layer_stack_names`] returns.
+    pub async fn retrieve_layer_stack_names(&self) -> io::Result<Vec<[u32; 5]>> {
+        self.store
+            .layer_store
+            .retrieve_layer_stack_names(self.head)
+            .await
+    }
+
+    // ---- existence ----
+    pub async fn triple_exists(
+        &self,
+        subject: u64,
+        predicate: u64,
+        object: u64,
+    ) -> io::Result<bool> {
+        self.store
+            .selective_id_triple_exists(self.head, IdTriple::new(subject, predicate, object))
+            .await
+    }
+    pub async fn id_triple_exists(&self, triple: IdTriple) -> io::Result<bool> {
+        self.store
+            .selective_id_triple_exists(self.head, triple)
+            .await
+    }
+    pub async fn value_triple_exists(&self, triple: &ValueTriple) -> io::Result<bool> {
+        self.store
+            .selective_value_triple_exists(self.head, triple)
+            .await
+    }
+
+    // ---- traversal ----
+    pub async fn triples_s(&self, subject: u64) -> io::Result<Vec<IdTriple>> {
+        self.store.selective_id_triples_s(self.head, subject).await
+    }
+    pub async fn triples_sp(&self, subject: u64, predicate: u64) -> io::Result<Vec<IdTriple>> {
+        self.store
+            .selective_id_triples_sp(self.head, subject, predicate)
+            .await
+    }
+    pub async fn triples_p(&self, predicate: u64) -> io::Result<Vec<IdTriple>> {
+        self.store
+            .selective_id_triples_p(self.head, predicate)
+            .await
+    }
+    pub async fn triples_value_range(
+        &self,
+        low: &tdb_succinct::TypedDictEntry,
+        high: &tdb_succinct::TypedDictEntry,
+    ) -> io::Result<Vec<IdTriple>> {
+        self.store
+            .selective_id_triples_value_range(self.head, low, high, false)
+            .await
+    }
+    pub async fn triples_value_range_rev(
+        &self,
+        low: &tdb_succinct::TypedDictEntry,
+        high: &tdb_succinct::TypedDictEntry,
+    ) -> io::Result<Vec<IdTriple>> {
+        self.store
+            .selective_id_triples_value_range(self.head, low, high, true)
+            .await
+    }
+    pub async fn triples_o(&self, object: u64) -> io::Result<Vec<IdTriple>> {
+        self.store.selective_id_triples_o(self.head, object).await
+    }
+    /// Every id-triple in the graph, in sorted order, merge-streamed from the
+    /// per-layer adjacency without materializing whole layers. Mirrors
+    /// `Layer::triples`.
+    pub async fn triples(&self) -> io::Result<impl Iterator<Item = IdTriple> + Send> {
+        self.store.selective_id_triples(self.head).await
+    }
+
+    // ---- single-layer deltas (this head layer's own additions/removals) ----
+    //
+    // These mirror the `SyncStoreLayer` delta API the store-prolog FFI predicates
+    // `id_triple_addition` / `id_triple_removal` need. They are disk-less on an
+    // object backend: each loads only this one layer's adjacency (via the
+    // LayerStore's single-layer iterators), never a whole materialized layer.
+    pub async fn triple_addition_exists(
+        &self,
+        subject: u64,
+        predicate: u64,
+        object: u64,
+    ) -> io::Result<bool> {
+        self.store
+            .layer_store
+            .triple_addition_exists(self.head, subject, predicate, object)
+            .await
+    }
+    pub async fn triple_removal_exists(
+        &self,
+        subject: u64,
+        predicate: u64,
+        object: u64,
+    ) -> io::Result<bool> {
+        self.store
+            .layer_store
+            .triple_removal_exists(self.head, subject, predicate, object)
+            .await
+    }
+    pub async fn triple_additions(&self) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        Ok(Box::new(
+            self.store.layer_store.triple_additions(self.head).await?,
+        ))
+    }
+    pub async fn triple_removals(&self) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        Ok(Box::new(
+            self.store.layer_store.triple_removals(self.head).await?,
+        ))
+    }
+    pub async fn triple_additions_s(
+        &self,
+        subject: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_additions_s(self.head, subject)
+            .await
+    }
+    pub async fn triple_removals_s(
+        &self,
+        subject: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_removals_s(self.head, subject)
+            .await
+    }
+    pub async fn triple_additions_sp(
+        &self,
+        subject: u64,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_additions_sp(self.head, subject, predicate)
+            .await
+    }
+    pub async fn triple_removals_sp(
+        &self,
+        subject: u64,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_removals_sp(self.head, subject, predicate)
+            .await
+    }
+    pub async fn triple_additions_p(
+        &self,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_additions_p(self.head, predicate)
+            .await
+    }
+    pub async fn triple_removals_p(
+        &self,
+        predicate: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_removals_p(self.head, predicate)
+            .await
+    }
+    pub async fn triple_additions_o(
+        &self,
+        object: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_additions_o(self.head, object)
+            .await
+    }
+    pub async fn triple_removals_o(
+        &self,
+        object: u64,
+    ) -> io::Result<Box<dyn Iterator<Item = IdTriple> + Send>> {
+        self.store
+            .layer_store
+            .triple_removals_o(self.head, object)
+            .await
+    }
+
+    // ---- forward resolution (string -> id) ----
+    pub async fn subject_id(&self, subject: &str) -> io::Result<Option<u64>> {
+        self.store.selective_subject_id(self.head, subject).await
+    }
+    pub async fn predicate_id(&self, predicate: &str) -> io::Result<Option<u64>> {
+        self.store
+            .selective_predicate_id(self.head, predicate)
+            .await
+    }
+    pub async fn object_node_id(&self, object: &str) -> io::Result<Option<u64>> {
+        self.store
+            .selective_object_id(self.head, &ObjectType::Node(object.to_string()))
+            .await
+    }
+    pub async fn object_value_id(
+        &self,
+        object: &tdb_succinct::TypedDictEntry,
+    ) -> io::Result<Option<u64>> {
+        self.store
+            .selective_object_id(self.head, &ObjectType::Value(object.clone()))
+            .await
+    }
+    pub async fn value_triple_to_id(&self, triple: &ValueTriple) -> io::Result<Option<IdTriple>> {
+        self.store
+            .selective_value_triple_to_id(self.head, triple)
+            .await
+    }
+
+    // ---- reverse resolution (id -> string/value) ----
+    pub async fn id_subject(&self, id: u64) -> io::Result<Option<String>> {
+        self.store.selective_id_subject(self.head, id).await
+    }
+    pub async fn id_predicate(&self, id: u64) -> io::Result<Option<String>> {
+        self.store.selective_id_predicate(self.head, id).await
+    }
+    pub async fn id_object(&self, id: u64) -> io::Result<Option<ObjectType>> {
+        self.store.selective_id_object(self.head, id).await
+    }
+    pub async fn id_triple_to_string(&self, triple: IdTriple) -> io::Result<Option<ValueTriple>> {
+        self.store
+            .selective_id_triple_to_string(self.head, triple)
+            .await
+    }
+}
+
 /// Open a store that is entirely in memory.
 ///
 /// This is useful for testing purposes, or if the database is only going to be used for caching purposes.
@@ -1028,6 +2604,80 @@ pub fn open_directory_store<P: Into<PathBuf>>(path: P) -> Store {
     )
 }
 
+/// Open a store backed by an S3-compatible object store.
+///
+/// Layers are stored as single archive objects and labels as compare-and-swap
+/// objects, both under `prefix` in the given [`object_store::ObjectStore`]. The
+/// bucket is the source of truth and the sole coordinator between replicas.
+///
+/// `cache_size` specifies, in megabytes, how large the in-memory LRU cache of
+/// whole layer archives should be. Because layers are immutable, cached entries
+/// are only ever evicted, never invalidated.
+///
+/// Develop and test against `object_store::memory::InMemory` or
+/// `object_store::local::LocalFileSystem` for a network-free store; point it at
+/// an `AmazonS3Builder`-built store (with an endpoint override for R2/MinIO) for
+/// real object storage.
+#[cfg(feature = "object-store")]
+pub fn open_object_store(
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: impl Into<String>,
+    cache_size: usize,
+) -> Store {
+    use crate::storage::object::{ObjectArchiveBackend, ObjectLabelStore};
+    let prefix = prefix.into();
+    let object_backend = ObjectArchiveBackend::new(store.clone(), prefix.clone());
+    let archive_backend =
+        LruArchiveBackend::new(object_backend.clone(), object_backend, cache_size);
+    Store::new(
+        ObjectLabelStore::new(store, prefix),
+        CachedLayerStore::new(
+            ArchiveLayerStore::new(archive_backend.clone(), archive_backend),
+            LockingHashMapLayerCache::new(),
+        ),
+    )
+}
+
+/// Like [`open_object_store`], but inserts a local-disk spill cache of whole
+/// layer archives between the in-memory LRU and the network.
+///
+/// This gives a three-tier read path — bounded in-memory LRU → local disk →
+/// object store — so a warm replica serves layers from local disk without a
+/// round-trip, and a cold replica populates that disk cache as it reads. Because
+/// layers are immutable, disk entries never need invalidation; manage the
+/// directory's size out of band. The returned [`Store`] carries a handle to the
+/// disk tier's [`CacheStats`](crate::storage::object_cache::CacheStatsSnapshot)
+/// via the returned [`DiskSpillArchiveBackend`] for metrics.
+#[cfg(feature = "object-store")]
+pub fn open_object_store_with_cache(
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: impl Into<String>,
+    mem_cache_size: usize,
+    disk_cache_dir: PathBuf,
+) -> (
+    Store,
+    crate::storage::object_cache::DiskSpillArchiveBackend<
+        crate::storage::object::ObjectArchiveBackend,
+    >,
+) {
+    use crate::storage::object::{ObjectArchiveBackend, ObjectLabelStore};
+    use crate::storage::object_cache::DiskSpillArchiveBackend;
+    let prefix = prefix.into();
+    let object_backend = ObjectArchiveBackend::new(store.clone(), prefix.clone());
+    let disk_backend = DiskSpillArchiveBackend::new(object_backend.clone(), disk_cache_dir);
+    // metadata from the origin; data flows in-memory LRU -> disk -> origin.
+    let archive_backend =
+        LruArchiveBackend::new(object_backend, disk_backend.clone(), mem_cache_size);
+    let store = Store::new(
+        ObjectLabelStore::new(store, prefix),
+        CachedLayerStore::new(
+            ArchiveLayerStore::new(archive_backend.clone(), archive_backend),
+            LockingHashMapLayerCache::new(),
+        ),
+    );
+    (store, disk_backend)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,6 +2726,796 @@ mod tests {
         let store = open_directory_store(dir.path());
 
         create_and_manipulate_database(store).await;
+    }
+
+    #[tokio::test]
+    async fn create_and_manipulate_archive_database() {
+        // Exercises the archive (.larch) path with the mmap-backed
+        // DirectoryArchiveBackend + LRU.
+        let dir = tempdir().unwrap();
+        let store = open_archive_store(dir.path(), 100);
+
+        create_and_manipulate_database(store).await;
+    }
+
+    #[tokio::test]
+    async fn archive_database_reopens_from_disk() {
+        // A fresh store over the same directory reads layers back via mmap.
+        let dir = tempdir().unwrap();
+        let name = {
+            let store = open_archive_store(dir.path(), 100);
+            let db = store.create("g").await.unwrap();
+            let builder = store.create_base_layer().await.unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_string_value("cow", "says", "moo"))
+                .unwrap();
+            let layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+            layer.name()
+        };
+        let store = open_archive_store(dir.path(), 100);
+        let layer = store.get_layer_from_id(name).await.unwrap().unwrap();
+        assert!(layer.value_triple_exists(&ValueTriple::new_string_value("cow", "says", "moo")));
+    }
+
+    #[tokio::test]
+    async fn selective_id_triple_exists_matches_full_layer() {
+        // Build a chain that exercises add, remove-of-a-base-triple, and re-add.
+        let store = open_memory_store();
+        let db = store.create("g").await.unwrap();
+
+        let vs = |s, p, o| ValueTriple::new_string_value(s, p, o);
+        let vn = |s, p, o| ValueTriple::new_node(s, p, o);
+
+        let builder = store.create_base_layer().await.unwrap();
+        builder.add_value_triple(vs("a", "p", "1")).unwrap();
+        builder.add_value_triple(vs("b", "p", "2")).unwrap();
+        builder.add_value_triple(vn("a", "links", "b")).unwrap();
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        let builder = layer.open_write().await.unwrap();
+        builder.add_value_triple(vs("c", "p", "3")).unwrap();
+        builder.remove_value_triple(vs("a", "p", "1")).unwrap(); // remove a base triple
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        let builder = layer.open_write().await.unwrap();
+        builder.add_value_triple(vs("a", "p", "1")).unwrap(); // re-add it
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        // Ground truth via the fully-materialized layer.
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+
+        // A mix of present and absent (but resolvable) triples.
+        let candidates = [
+            vs("a", "p", "1"),     // removed then re-added -> exists
+            vs("b", "p", "2"),     // base -> exists
+            vs("c", "p", "3"),     // added -> exists
+            vn("a", "links", "b"), // node -> exists
+            vs("a", "p", "2"),     // strings all exist, triple does not -> absent
+            vs("b", "p", "3"),     // absent
+        ];
+        for cand in &candidates {
+            let expected = full.value_triple_exists(cand);
+            let idt = full
+                .value_triple_to_id(cand)
+                .expect("all strings in these candidates exist in the dictionary");
+            let got = store.selective_id_triple_exists(head, idt).await.unwrap();
+            assert_eq!(expected, got, "mismatch for {:?}", cand);
+        }
+    }
+
+    #[tokio::test]
+    async fn selective_value_triple_exists_matches_full_layer() {
+        selective_value_triple_exists_body(open_memory_store()).await;
+    }
+
+    // Same differential check over an object-backed store (these small
+    // dictionaries stay under the block-lazy threshold, so this exercises the
+    // object selective path's whole-dictionary branch).
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn selective_value_triple_exists_matches_full_layer_object() {
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        selective_value_triple_exists_body(open_object_store(bucket, "", 1 << 30)).await;
+    }
+
+    // Differential check over an object store with dictionaries large enough
+    // (> BLOCK_LAZY_MIN_ENTRIES) that subject and predicate resolution take the
+    // block-lazy path. Verifies block-lazy resolution over the full selective
+    // pipeline agrees with the fully-materialized layer for present, absent, and
+    // removed triples.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn selective_value_triple_exists_block_lazy_large_dict() {
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = open_object_store(bucket, "", 1 << 30);
+        let db = store.create("g").await.unwrap();
+
+        // > 512 distinct subjects and > 512 distinct predicates so both the node
+        // and predicate dictionaries cross the block-lazy threshold.
+        let vn = |s: &str, p: &str, o: &str| ValueTriple::new_node(s, p, o);
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..1200 {
+            builder
+                .add_value_triple(vn(
+                    &format!("subj{:05}", i),
+                    &format!("pred{:05}", i % 700),
+                    &format!("subj{:05}", (i + 1) % 1200),
+                ))
+                .unwrap();
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        // child: remove a few, add a few
+        let builder = layer.open_write().await.unwrap();
+        for i in 0..20 {
+            builder
+                .remove_value_triple(vn(
+                    &format!("subj{:05}", i),
+                    &format!("pred{:05}", i % 700),
+                    &format!("subj{:05}", (i + 1) % 1200),
+                ))
+                .unwrap();
+        }
+        builder
+            .add_value_triple(vn("subj00000", "pred00000", "subj00002"))
+            .unwrap();
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+
+        let mut candidates: Vec<ValueTriple> = Vec::new();
+        for i in (0..1200).step_by(37) {
+            candidates.push(vn(
+                &format!("subj{:05}", i),
+                &format!("pred{:05}", i % 700),
+                &format!("subj{:05}", (i + 1) % 1200),
+            ));
+        }
+        candidates.push(vn("subj00000", "pred00000", "subj00002")); // removed then re-added
+        candidates.push(vn("subj00005", "pred00005", "subj00006")); // removed -> absent
+        candidates.push(vn("absentsubj", "pred00000", "subj00002")); // absent subject
+        candidates.push(vn("subj00010", "absentpred", "subj00011")); // absent predicate
+        candidates.push(vn("subj00010", "pred00010", "subj00099")); // resolvable, absent triple
+
+        for cand in &candidates {
+            let expected = full.value_triple_exists(cand);
+            let got = store
+                .selective_value_triple_exists(head, cand)
+                .await
+                .unwrap();
+            assert_eq!(
+                expected, got,
+                "mismatch for {:?} (expected {})",
+                cand, expected
+            );
+        }
+    }
+
+    // Differential check for the block-lazy typed value dictionary through the
+    // full selective pipeline: a value dictionary large enough (> threshold) and
+    // spanning multiple datatypes so BlockLazyTypedDict's per-segment binary
+    // search resolves value objects.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn selective_value_triple_exists_block_lazy_large_value_dict() {
+        use tdb_succinct::TdbDataType;
+
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = open_object_store(bucket, "", 1 << 30);
+        let db = store.create("g").await.unwrap();
+
+        let vs = |s: &str, o: &str| ValueTriple::new_string_value(s, "sp", o);
+        let vi =
+            |s: &str, i: i32| ValueTriple::new_value(s, "ip", <i32 as TdbDataType>::make_entry(&i));
+        let vf =
+            |s: &str, f: f64| ValueTriple::new_value(s, "fp", <f64 as TdbDataType>::make_entry(&f));
+
+        // > 512 entries per datatype so the value dict crosses the threshold and
+        // spans three segments.
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..600 {
+            builder
+                .add_value_triple(vs(&format!("s{:04}", i), &format!("str{:04}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vi(&format!("s{:04}", i), i))
+                .unwrap();
+            builder
+                .add_value_triple(vf(&format!("s{:04}", i), i as f64 * 0.25))
+                .unwrap();
+        }
+        let layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+
+        let mut candidates: Vec<ValueTriple> = Vec::new();
+        for i in (0..600).step_by(23) {
+            candidates.push(vs(&format!("s{:04}", i), &format!("str{:04}", i)));
+            candidates.push(vi(&format!("s{:04}", i), i));
+            candidates.push(vf(&format!("s{:04}", i), i as f64 * 0.25));
+        }
+        candidates.push(vs("s0000", "str0001")); // resolvable, absent triple
+        candidates.push(vi("s0000", 999_999)); // absent i32 value
+        candidates.push(vf("s0000", -1.0)); // absent f64 value
+        candidates.push(vs("absent", "str0000")); // absent subject
+
+        for cand in &candidates {
+            let expected = full.value_triple_exists(cand);
+            let got = store
+                .selective_value_triple_exists(head, cand)
+                .await
+                .unwrap();
+            assert_eq!(
+                expected, got,
+                "mismatch for {:?} (expected {})",
+                cand, expected
+            );
+        }
+    }
+
+    // The LazyLayer facade must answer the common query operations exactly like
+    // the fully-materialized layer, disk-lessly.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn lazy_layer_facade_matches_full_layer() {
+        use tdb_succinct::TdbDataType;
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = open_object_store(bucket, "", 1 << 30);
+        let db = store.create("g").await.unwrap();
+
+        let vs = |s: &str, o: &str| ValueTriple::new_string_value(s, "p", o);
+        let vi = |s: &str, i: i32| {
+            ValueTriple::new_value(s, "age", <i32 as TdbDataType>::make_entry(&i))
+        };
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..700 {
+            builder
+                .add_value_triple(vs(&format!("n{:04}", i), &format!("s{:04}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vi(&format!("n{:04}", i), i))
+                .unwrap();
+        }
+        let layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+        let lazy = store.lazy_layer(head);
+        assert_eq!(head, lazy.name());
+
+        let present = vs("n0100", "s0100");
+        let present_i = vi("n0200", 200);
+        let absent = vs("n0100", "s0101");
+
+        // existence + forward resolution
+        assert!(lazy.value_triple_exists(&present).await.unwrap());
+        assert!(lazy.value_triple_exists(&present_i).await.unwrap());
+        assert!(!lazy.value_triple_exists(&absent).await.unwrap());
+        assert_eq!(
+            full.value_triple_to_id(&present),
+            lazy.value_triple_to_id(&present).await.unwrap()
+        );
+        assert_eq!(
+            full.subject_id("n0100"),
+            lazy.subject_id("n0100").await.unwrap()
+        );
+        assert_eq!(
+            full.predicate_id("p"),
+            lazy.predicate_id("p").await.unwrap()
+        );
+
+        // traversal + reverse resolution, cross-checked against the full layer
+        let sid = lazy.subject_id("n0100").await.unwrap().unwrap();
+        let mut lazy_s = lazy.triples_s(sid).await.unwrap();
+        let mut full_s: Vec<IdTriple> = full.triples_s(sid).collect();
+        lazy_s.sort();
+        full_s.sort();
+        assert_eq!(full_s, lazy_s);
+        for t in &full_s {
+            assert!(lazy
+                .triple_exists(t.subject, t.predicate, t.object)
+                .await
+                .unwrap());
+            assert_eq!(
+                full.id_triple_to_string(t),
+                lazy.id_triple_to_string(*t).await.unwrap()
+            );
+        }
+        assert_eq!(full.id_subject(sid), lazy.id_subject(sid).await.unwrap());
+    }
+
+    // The disk-less full scan must yield exactly the fully-materialized layer's
+    // triples, including reconciliation of additions against removals.
+    #[tokio::test]
+    async fn selective_id_triples_scan_matches_full_layer_memory() {
+        scan_body(open_memory_store()).await;
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn selective_id_triples_scan_matches_full_layer_object() {
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        scan_body(open_object_store(bucket, "", 1 << 30)).await;
+    }
+
+    async fn scan_body(store: Store) {
+        let db = store.create("g").await.unwrap();
+        let vn = |s: &str, p: &str, o: &str| ValueTriple::new_node(s, p, o);
+
+        // base: a spread of triples
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..80 {
+            builder
+                .add_value_triple(vn(&format!("s{:03}", i), "p", &format!("o{:03}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vn(
+                    &format!("s{:03}", i),
+                    "q",
+                    &format!("o{:03}", (i + 1) % 80),
+                ))
+                .unwrap();
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        // child: remove some, add some (exercises the removal reconciliation)
+        let builder = layer.open_write().await.unwrap();
+        for i in 0..20 {
+            builder
+                .remove_value_triple(vn(&format!("s{:03}", i), "p", &format!("o{:03}", i)))
+                .unwrap();
+        }
+        for i in 80..110 {
+            builder
+                .add_value_triple(vn(&format!("s{:03}", i), "p", &format!("o{:03}", i)))
+                .unwrap();
+        }
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        // grandchild: re-add one previously removed, remove a fresh one
+        let builder = layer.open_write().await.unwrap();
+        builder.add_value_triple(vn("s000", "p", "o000")).unwrap();
+        builder
+            .remove_value_triple(vn("s085", "p", "o085"))
+            .unwrap();
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+        let mut expected: Vec<IdTriple> = full.triples().collect();
+        let mut got: Vec<IdTriple> = store.selective_id_triples(head).await.unwrap().collect();
+        expected.sort();
+        got.sort();
+        assert_eq!(expected, got, "disk-less scan differs from full layer");
+        assert!(!expected.is_empty());
+
+        // LazyLayer::triples yields the same set.
+        let mut via_lazy: Vec<IdTriple> = store.lazy_layer(head).triples().await.unwrap().collect();
+        via_lazy.sort();
+        assert_eq!(expected, via_lazy);
+    }
+
+    // Reverse (id -> string) resolution must match the fully-materialized layer.
+    #[tokio::test]
+    async fn selective_reverse_resolution_matches_full_layer_memory() {
+        reverse_resolution_body(open_memory_store()).await;
+    }
+
+    // Same, over an object store with dictionaries large enough to drive the
+    // block-lazy id -> string / id -> value path.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn selective_reverse_resolution_matches_full_layer_object_block_lazy() {
+        let bucket: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        reverse_resolution_body(open_object_store(bucket, "", 1 << 30)).await;
+    }
+
+    async fn reverse_resolution_body(store: Store) {
+        use tdb_succinct::TdbDataType;
+
+        let db = store.create("g").await.unwrap();
+        let vs = |s: &str, o: &str| ValueTriple::new_string_value(s, "p", o);
+        let vn = |s: &str, o: &str| ValueTriple::new_node(s, "rel", o);
+        let vi = |s: &str, i: i32| {
+            ValueTriple::new_value(s, "age", <i32 as TdbDataType>::make_entry(&i))
+        };
+
+        // base: enough distinct nodes and values to cross the block-lazy threshold
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..700 {
+            builder
+                .add_value_triple(vs(&format!("n{:04}", i), &format!("s{:04}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vn(&format!("n{:04}", i), &format!("n{:04}", (i + 1) % 700)))
+                .unwrap();
+            builder
+                .add_value_triple(vi(&format!("n{:04}", i), i))
+                .unwrap();
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        // a child layer, so id-maps and multi-layer offsets are exercised
+        let builder = layer.open_write().await.unwrap();
+        for i in 700..760 {
+            builder
+                .add_value_triple(vs(&format!("n{:04}", i), &format!("s{:04}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vi(&format!("n{:04}", i), i))
+                .unwrap();
+        }
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+        let triples: Vec<IdTriple> = full.triples().collect();
+        assert!(triples.len() > 1000);
+
+        // Sample across the id space (resolving every triple is O(chain) each).
+        for t in triples.iter().step_by(29) {
+            assert_eq!(
+                full.id_subject(t.subject),
+                store.selective_id_subject(head, t.subject).await.unwrap(),
+                "id_subject {}",
+                t.subject
+            );
+            assert_eq!(
+                full.id_predicate(t.predicate),
+                store
+                    .selective_id_predicate(head, t.predicate)
+                    .await
+                    .unwrap(),
+                "id_predicate {}",
+                t.predicate
+            );
+            assert_eq!(
+                full.id_object(t.object),
+                store.selective_id_object(head, t.object).await.unwrap(),
+                "id_object {}",
+                t.object
+            );
+            assert_eq!(
+                full.id_triple_to_string(t),
+                store.selective_id_triple_to_string(head, *t).await.unwrap(),
+                "id_triple_to_string {:?}",
+                t
+            );
+        }
+        // out-of-range ids resolve to None
+        assert_eq!(None, store.selective_id_subject(head, 0).await.unwrap());
+        assert_eq!(None, store.selective_id_predicate(head, 0).await.unwrap());
+        assert_eq!(
+            None,
+            store.selective_id_object(head, 9_999_999).await.unwrap()
+        );
+    }
+
+    async fn selective_value_triple_exists_body(store: Store) {
+        use tdb_succinct::TdbDataType;
+
+        let db = store.create("g").await.unwrap();
+
+        let vs = |s: &str, p: &str, o: &str| ValueTriple::new_string_value(s, p, o);
+        let vn = |s: &str, p: &str, o: &str| ValueTriple::new_node(s, p, o);
+        let vv = |s: &str, p: &str, i: i32| -> ValueTriple {
+            ValueTriple::new_value(s, p, <i32 as TdbDataType>::make_entry(&i))
+        };
+
+        // base: nodes, string values, and typed (i32) values
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..40 {
+            builder
+                .add_value_triple(vs(&format!("n{}", i), "p", &format!("str{}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vn(&format!("n{}", i), "rel", &format!("n{}", (i + 1) % 40)))
+                .unwrap();
+            builder
+                .add_value_triple(vv(&format!("n{}", i), "age", i))
+                .unwrap();
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        // child: add more, remove some (nodes and typed values)
+        let builder = layer.open_write().await.unwrap();
+        for i in 40..60 {
+            builder
+                .add_value_triple(vs(&format!("n{}", i), "p", &format!("str{}", i)))
+                .unwrap();
+            builder
+                .add_value_triple(vv(&format!("n{}", i), "age", i))
+                .unwrap();
+        }
+        for i in 0..10 {
+            builder
+                .remove_value_triple(vv(&format!("n{}", i), "age", i))
+                .unwrap();
+            builder
+                .remove_value_triple(vn(&format!("n{}", i), "rel", &format!("n{}", (i + 1) % 40)))
+                .unwrap();
+        }
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        // child2: re-add a removed one, add a fresh string
+        let builder = layer.open_write().await.unwrap();
+        builder.add_value_triple(vv("n0", "age", 0)).unwrap();
+        builder.add_value_triple(vs("z", "zz", "zzz")).unwrap();
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+
+        // Candidates: present + absent across all three object kinds.
+        let mut candidates: Vec<ValueTriple> = Vec::new();
+        for i in 0..65 {
+            candidates.push(vs(&format!("n{}", i), "p", &format!("str{}", i)));
+            candidates.push(vn(&format!("n{}", i), "rel", &format!("n{}", (i + 1) % 40)));
+            candidates.push(vv(&format!("n{}", i), "age", i));
+        }
+        candidates.push(vs("n0", "p", "str1")); // resolvable, absent triple
+        candidates.push(vv("n5", "age", 999)); // absent typed value
+        candidates.push(vs("absent", "p", "x")); // absent subject
+        candidates.push(vn("n0", "rel", "n1")); // removed -> absent
+        candidates.push(vv("n0", "age", 0)); // removed then re-added -> present
+        candidates.push(vs("z", "zz", "zzz")); // present (child2)
+
+        for cand in &candidates {
+            let expected = full.value_triple_exists(cand);
+            let got = store
+                .selective_value_triple_exists(head, cand)
+                .await
+                .unwrap();
+            assert_eq!(
+                expected, got,
+                "mismatch for {:?} (expected {})",
+                cand, expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selective_id_triples_iterators_match_full_layer() {
+        use std::collections::HashSet;
+
+        let store = open_memory_store();
+        let db = store.create("g").await.unwrap();
+        let vn = |s: &str, p: &str, o: &str| ValueTriple::new_node(s, p, o);
+
+        // base
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..30 {
+            for p in 0..3 {
+                builder
+                    .add_value_triple(vn(
+                        &format!("s{}", i),
+                        &format!("p{}", p),
+                        &format!("s{}", (i + p + 1) % 30),
+                    ))
+                    .unwrap();
+            }
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        // child: add + remove
+        let builder = layer.open_write().await.unwrap();
+        for i in 30..40 {
+            builder
+                .add_value_triple(vn(&format!("s{}", i), "p0", "s0"))
+                .unwrap();
+        }
+        for i in 0..10 {
+            builder
+                .remove_value_triple(vn(&format!("s{}", i), "p1", &format!("s{}", (i + 2) % 30)))
+                .unwrap();
+        }
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+
+        // child2: re-add one removed
+        let builder = layer.open_write().await.unwrap();
+        builder.add_value_triple(vn("s0", "p1", "s2")).unwrap();
+        layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        let head = layer.name();
+
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+        let all: Vec<IdTriple> = full.triples().collect();
+        let subjects: HashSet<u64> = all.iter().map(|t| t.subject).collect();
+        let predicates: HashSet<u64> = all.iter().map(|t| t.predicate).collect();
+        let objects: HashSet<u64> = all.iter().map(|t| t.object).collect();
+
+        let sorted = |it: Box<dyn Iterator<Item = IdTriple> + Send>| {
+            let mut v: Vec<IdTriple> = it.collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+
+        for &s in &subjects {
+            assert_eq!(
+                sorted(full.triples_s(s)),
+                store.selective_id_triples_s(head, s).await.unwrap(),
+                "triples_s({})",
+                s
+            );
+        }
+        for &p in &predicates {
+            assert_eq!(
+                sorted(full.triples_p(p)),
+                store.selective_id_triples_p(head, p).await.unwrap(),
+                "triples_p({})",
+                p
+            );
+        }
+        for &o in &objects {
+            assert_eq!(
+                sorted(full.triples_o(o)),
+                store.selective_id_triples_o(head, o).await.unwrap(),
+                "triples_o({})",
+                o
+            );
+        }
+        for t in all.iter().take(25) {
+            assert_eq!(
+                sorted(full.triples_sp(t.subject, t.predicate)),
+                store
+                    .selective_id_triples_sp(head, t.subject, t.predicate)
+                    .await
+                    .unwrap(),
+                "triples_sp({},{})",
+                t.subject,
+                t.predicate
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn selective_value_triple_exists_matches_full_layer_randomized() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use tdb_succinct::TdbDataType;
+
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let store = open_memory_store();
+        let db = store.create("g").await.unwrap();
+
+        // Build a random multi-layer graph, remembering every triple ever added
+        // so we can use them (plus random absent ones) as candidates.
+        let mut candidates: Vec<ValueTriple> = Vec::new();
+        let mk = |kind: u8, a: u32, b: u32, rng: &mut StdRng| -> ValueTriple {
+            let s = format!("s{}", a % 40);
+            let p = format!("p{}", b % 6);
+            match kind % 3 {
+                0 => ValueTriple::new_node(&s, &p, &format!("s{}", rng.gen_range(0..40))),
+                1 => ValueTriple::new_string_value(&s, &p, &format!("v{}", rng.gen_range(0..50))),
+                _ => ValueTriple::new_value(
+                    &s,
+                    &p,
+                    <i32 as TdbDataType>::make_entry(&(rng.gen_range(0..100) as i32)),
+                ),
+            }
+        };
+
+        let mut head = None;
+        for _layer in 0..5 {
+            let builder = match head {
+                None => store.create_base_layer().await.unwrap(),
+                Some(h) => store
+                    .get_layer_from_id(h)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .open_write()
+                    .await
+                    .unwrap(),
+            };
+            for _ in 0..30 {
+                let t = mk(rng.gen(), rng.gen(), rng.gen(), &mut rng);
+                builder.add_value_triple(t.clone()).unwrap();
+                candidates.push(t);
+            }
+            // remove some previously-added triples
+            for _ in 0..8 {
+                if let Some(t) = candidates.get(rng.gen_range(0..candidates.len())).cloned() {
+                    builder.remove_value_triple(t).unwrap();
+                }
+            }
+            let layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+            head = Some(layer.name());
+        }
+        let head = head.unwrap();
+        let full = store.get_layer_from_id(head).await.unwrap().unwrap();
+
+        // add some certainly-absent candidates
+        for _ in 0..30 {
+            candidates.push(ValueTriple::new_string_value(
+                &format!("s{}", rng.gen_range(0..40)),
+                &format!("p{}", rng.gen_range(0..6)),
+                &format!("absent{}", rng.gen_range(0..1000)),
+            ));
+        }
+
+        for cand in &candidates {
+            let expected = full.value_triple_exists(cand);
+            let got = store
+                .selective_value_triple_exists(head, cand)
+                .await
+                .unwrap();
+            assert_eq!(
+                expected, got,
+                "mismatch for {:?} (expected {})",
+                cand, expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_compaction_bounds_depth_in_background() {
+        let store = open_memory_store();
+        let db = store.create("g").await.unwrap();
+
+        let builder = store.create_base_layer().await.unwrap();
+        builder
+            .add_value_triple(ValueTriple::new_string_value("a", "p", "1"))
+            .unwrap();
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        for i in 1..5 {
+            let builder = layer.open_write().await.unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_string_value(&format!("k{}", i), "p", "v"))
+                .unwrap();
+            layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+        }
+        let head_name = layer.name();
+
+        let handle = store.spawn_compaction(2, std::time::Duration::from_millis(20));
+
+        // wait (bounded) for a background tick to roll the deep head up
+        let mut rolled = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let internal = store
+                .layer_store
+                .get_layer(head_name)
+                .await
+                .unwrap()
+                .unwrap();
+            if internal.is_rollup() {
+                rolled = true;
+                break;
+            }
+        }
+        handle.abort();
+        assert!(
+            rolled,
+            "background compaction should have rolled up the deep head"
+        );
     }
 
     #[tokio::test]
@@ -1306,6 +3746,133 @@ mod tests {
                 ValueTriple::new_string_value("bunny", "says", "sniff"),
             ],
             all_triples
+        );
+    }
+
+    /// After a rollup, the materialized path reads through the rollup layer
+    /// while the disk-less path still walks the original chain. If those two
+    /// disagree about ids or membership, disk-less reads are wrong on any graph
+    /// that has ever been rolled up -- which is every maintained graph.
+    #[tokio::test]
+    async fn disk_less_reads_agree_with_materialized_after_rollup() {
+        let store = open_memory_store();
+        let db = store.create("g").await.unwrap();
+
+        let builder = store.create_base_layer().await.unwrap();
+        for i in 0..50 {
+            builder
+                .add_value_triple(ValueTriple::new_string_value(
+                    &format!("s{:03}", i),
+                    "p",
+                    &format!("o{:03}", i),
+                ))
+                .unwrap();
+        }
+        let mut layer = builder.commit().await.unwrap();
+        db.set_head(&layer).await.unwrap();
+        for d in 0..3 {
+            let b = layer.open_write().await.unwrap();
+            b.add_value_triple(ValueTriple::new_string_value(
+                &format!("d{}", d),
+                "p",
+                &format!("v{}", d),
+            ))
+            .unwrap();
+            layer = b.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+        }
+        let head = layer.name();
+
+        let probe = ValueTriple::new_string_value("s025", "p", "o025");
+        let before = store
+            .selective_value_triple_exists(head, &probe)
+            .await
+            .unwrap();
+        assert!(before, "the triple is there before the rollup");
+
+        layer.clone().rollup().await.unwrap();
+
+        // Materialized view after the rollup.
+        let materialized = store.get_layer_from_id(head).await.unwrap().unwrap();
+        let m_id = materialized.value_triple_to_id(&probe);
+        assert!(m_id.is_some(), "materialized still resolves the triple");
+        assert!(materialized.id_triple_exists(m_id.unwrap()));
+
+        // Disk-less view of the same head, which now follows the rollup.
+        assert!(
+            store
+                .selective_value_triple_exists(head, &probe)
+                .await
+                .unwrap(),
+            "disk-less read must still find the triple after a rollup"
+        );
+        assert_eq!(
+            store
+                .selective_value_triple_to_id(head, &probe)
+                .await
+                .unwrap(),
+            m_id,
+            "disk-less and materialized must agree on the id after a rollup"
+        );
+
+        // The whole disk-less surface must match the materialized layer, since
+        // it now reads the rollup rather than the original chain.
+        let lazy = store.lazy_layer(head);
+        assert_eq!(
+            lazy.node_and_value_count().await.unwrap(),
+            materialized.node_and_value_count() as u64
+        );
+        assert_eq!(
+            lazy.predicate_count().await.unwrap(),
+            materialized.predicate_count() as u64
+        );
+        assert_eq!(
+            lazy.triple_count().await.unwrap(),
+            materialized.triple_count()
+        );
+
+        let mut m_all: Vec<IdTriple> = materialized.triples().collect();
+        let mut l_all: Vec<IdTriple> = lazy.triples().await.unwrap().collect();
+        m_all.sort();
+        l_all.sort();
+        assert_eq!(l_all, m_all, "full scan must match after rollup");
+        assert!(!l_all.is_empty());
+
+        for t in m_all.iter().take(10) {
+            assert_eq!(
+                lazy.id_subject(t.subject).await.unwrap(),
+                materialized.id_subject(t.subject)
+            );
+            assert_eq!(
+                lazy.id_predicate(t.predicate).await.unwrap(),
+                materialized.id_predicate(t.predicate)
+            );
+            assert_eq!(
+                lazy.id_object(t.object).await.unwrap(),
+                materialized.id_object(t.object)
+            );
+            assert!(lazy
+                .triple_exists(t.subject, t.predicate, t.object)
+                .await
+                .unwrap());
+        }
+
+        let (s, p, o) = (m_all[0].subject, m_all[0].predicate, m_all[0].object);
+        let sorted = |mut v: Vec<IdTriple>| {
+            v.sort();
+            v
+        };
+        assert_eq!(
+            sorted(lazy.triples_s(s).await.unwrap()),
+            sorted(materialized.triples_s(s).collect())
+        );
+        assert_eq!(
+            sorted(lazy.triples_p(p).await.unwrap()),
+            sorted(materialized.triples_p(p).collect())
+        );
+        assert_eq!(
+            sorted(lazy.triples_o(o).await.unwrap()),
+            sorted(materialized.triples_o(o).collect())
         );
     }
 

@@ -576,9 +576,7 @@ mod tests {
         // range that contains no entries
         let low = String::make_entry(&"gamma");
         let high = String::make_entry(&"zeta");
-        let triples: Vec<_> = layer
-            .triples_value_range(&low, &high)
-            .collect();
+        let triples: Vec<_> = layer.triples_value_range(&low, &high).collect();
 
         assert!(triples.is_empty());
     }
@@ -635,8 +633,14 @@ mod tests {
             .collect();
 
         let subjects: Vec<_> = triples.iter().map(|t| t.subject.as_str()).collect();
-        assert!(subjects.contains(&"doc2"), "should include beta from parent");
-        assert!(subjects.contains(&"doc4"), "should include banana from child");
+        assert!(
+            subjects.contains(&"doc2"),
+            "should include beta from parent"
+        );
+        assert!(
+            subjects.contains(&"doc4"),
+            "should include banana from child"
+        );
         assert_eq!(2, triples.len());
     }
 
@@ -693,7 +697,10 @@ mod tests {
             .triples_value_range(&low, &high)
             .map(|t| {
                 let obj = layer.id_object_value(t.object).unwrap();
-                (layer.id_subject(t.subject).unwrap(), obj.as_val::<u32, u32>())
+                (
+                    layer.id_subject(t.subject).unwrap(),
+                    obj.as_val::<u32, u32>(),
+                )
             })
             .collect();
 
