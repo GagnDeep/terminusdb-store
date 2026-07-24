@@ -134,14 +134,46 @@ above the per-prefix cap. This confirms, with measurements rather than
 arithmetic, the risk flagged in the object-store RFC: the disk-less path trades
 bytes for request count, and request count is what S3 rate-limits.
 
-Two mitigations, neither yet implemented:
+### Request coalescing — implemented
 
-- **Request coalescing** — merge adjacent block fetches within a query. The
-  request count is dominated by many small ranged GETs into the same few
-  structures, so this is where the headroom is.
+Profiling where the *requests* went (`profile_selective_request_breakdown`)
+found no single structure dominating. The largest was the node dictionary's
+block binary search at 32 requests; the bulk was ~20 different structures each
+costing 11–13 requests, one per layer, each tiny — `NegSPAdjacencyListBits` was
+11 requests for **88 bytes total**, eight bytes per request. Those are control
+words and index headers.
+
+So the fix is to fetch each layer's small structures together. Measured on MinIO
+at concurrency 4, toggled with `TDB_COALESCE_MAX_STRUCTURE_BYTES`:
+
+| | coalescing off | coalescing on | |
+|---|---|---|---|
+| selective existence p50 | 53.1 ms | **23.5 ms** | 2.3× faster |
+| requests per query | 350 | **87** | 4.0× fewer |
+| bytes per query | 11.1 KiB | 36.7 KiB | 3.3× **more** |
+| throughput under load | 65 q/s | **342 q/s** | 5.3× |
+| query p50 under load | 61.0 ms | **11.2 ms** | 5.5× lower |
+| object-store req/s | 19,459 | **9,382** | half the pressure |
+
+The last two rows together are the point: **5.3× the throughput at half the
+request rate**. The S3 ceiling moves from ~15 to **~63 disk-less queries per
+second per prefix** (5,500 ÷ 87).
+
+**This is a trade, not a free win.** Coalescing fetches whole small structures
+where the uncoalesced path took only the bytes it needed, so byte transfer rises
+2.9–3.3× — to *more* than reading the whole chain. That is the right trade
+against S3, where request rate is capped per prefix and bandwidth is not, and
+the wrong one where bytes are scarce. Hence the knob:
+`TDB_COALESCE_MAX_STRUCTURE_BYTES=0` disables it, and the default is 8 KiB.
+
+Note this invalidates the "a selective read moves ~8% of a full layer" claim
+*when coalescing is on*. With it off, that claim still holds.
+
+Still not implemented:
+
 - **Prefix sharding** — S3's limit is per prefix, so distributing layer objects
   across N prefixes multiplies the ceiling by roughly N. Cheap, and independent
-  of the above.
+  of coalescing; the two multiply.
 
 The materialized path pays 522 requests once and then serves from cache; the
 disk-less path pays ~350 per query. That is the real trade, and it argues for
