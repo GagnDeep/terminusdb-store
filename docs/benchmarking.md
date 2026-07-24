@@ -178,10 +178,17 @@ disk-less queries per second**.
 
 **This is a trade, not a free win.** Coalescing fetches whole small structures
 where the uncoalesced path took only the bytes it needed, so byte transfer rises
-2.9–3.3× — to *more* than reading the whole chain. That is the right trade
-against S3, where request rate is capped per prefix and bandwidth is not, and
-the wrong one where bytes are scarce. Hence the knob:
-`TDB_COALESCE_MAX_STRUCTURE_BYTES=0` disables it, and the default is 8 KiB.
+~3× — to *more* than reading the whole chain. That is the right trade against a
+store that rate-limits or bills per request while bandwidth is cheap, and the
+wrong one where bytes are scarce. Hence the knobs:
+`TDB_COALESCE_MAX_STRUCTURE_BYTES=0` disables it, the default is 8 KiB, and
+`ObjectArchiveBackend::without_coalescing()` disables it for one backend.
+
+A whole-layer fetch was also tried — probe the object's size, pull the whole
+thing when it is small — on the theory that one GET beats ten. Measured, it
+changed the request count not at all (2/8/24 either way) and cost slightly more
+bytes, because the coalesced span already covers nearly the whole object at this
+layer shape. The measurement was kept and the code dropped.
 
 Note this invalidates the "a selective read moves ~8% of a full layer" claim
 *when coalescing is on*. With it off, that claim still holds.
