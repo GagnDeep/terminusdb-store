@@ -404,6 +404,24 @@ impl BlockLazyTypedDict {
     /// The value-dictionary-local id of a typed entry, or `None` if absent —
     /// the same value as `TypedDict::id_entry(..).into_option()`.
     pub async fn id_of_entry(&self, entry: &TypedDictEntry) -> io::Result<Option<u64>> {
+        Ok(self
+            .lookup_entry(entry)
+            .await?
+            .and_then(|(result, _)| result.into_option()))
+    }
+
+    /// The full lookup result for `entry` — already composed with its datatype
+    /// segment's id offset — together with that offset. `None` if the entry's
+    /// datatype has no segment in this dictionary.
+    ///
+    /// [`id_of_entry`](Self::id_of_entry) discards everything but an exact hit.
+    /// A range query needs more: `Closest(i)` says where the entry *would* sort,
+    /// which is what turns a bound that is not itself present into a range
+    /// endpoint.
+    pub async fn lookup_entry(
+        &self,
+        entry: &TypedDictEntry,
+    ) -> io::Result<Option<(IdLookupResult, u64)>> {
         let dt = entry.datatype();
         let i = match self.types_present.index_of(dt as u64) {
             Some(i) => i,
@@ -443,7 +461,7 @@ impl BlockLazyTypedDict {
             }
         };
         // Compose with the segment's id offset, as `TypedDict::id_slice` does.
-        Ok(seg_result.offset(id_offset).into_option())
+        Ok(Some((seg_result.offset(id_offset), id_offset)))
     }
 
     /// The datatype segment a value-dictionary-local id belongs to (mirrors

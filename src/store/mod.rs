@@ -1905,6 +1905,133 @@ impl Store {
         Ok(reconcile_layered(per_layer))
     }
 
+    /// The object ids in `head`'s chain whose value falls in `[low, high)`, in
+    /// ascending order, and the disk-less triples that use them.
+    ///
+    /// Mirrors `InternalLayer::triples_value_range`: for each layer in the
+    /// chain, binary-search the two bounds in that layer's value dictionary,
+    /// walk the ids between them, and map each through the layer's id map and
+    /// cumulative offset into the global id space. Only the touched dictionary
+    /// blocks are fetched, so the cost scales with the width of the range rather
+    /// than the size of the dictionary.
+    ///
+    /// `rev` yields descending object order.
+    pub async fn selective_id_triples_value_range(
+        &self,
+        head: [u32; 5],
+        low: &tdb_succinct::TypedDictEntry,
+        high: &tdb_succinct::TypedDictEntry,
+        rev: bool,
+    ) -> io::Result<Vec<IdTriple>> {
+        // Both bounds must name the same datatype segment; mismatched bounds
+        // describe no range at all rather than an error.
+        if low.datatype() != high.datatype() {
+            return Ok(Vec::new());
+        }
+
+        let (chain, off_nv, node_counts, _, _) = self.chain_offsets(head).await?;
+        let ls = &self.layer_store;
+        let mut object_ids: Vec<u64> = Vec::new();
+
+        for (i, &layer) in chain.iter().enumerate() {
+            let bounds = self.value_range_bounds(layer, low, high).await?;
+            let (start, end) = match bounds {
+                Some(b) => b,
+                // this layer's value dictionary has no segment for the datatype
+                None => continue,
+            };
+            if start >= end {
+                continue;
+            }
+            let idmap = ls.get_node_value_idmap(layer).await?;
+            for pos in start..end {
+                // value ids sit above the node ids within a layer, then go
+                // through the id map and the chain's cumulative offset
+                let inner = pos + node_counts[i];
+                let outer = match &idmap {
+                    Some(m) => m.inner_to_outer(inner),
+                    None => inner,
+                };
+                object_ids.push(outer + off_nv[i]);
+            }
+        }
+
+        // Object ids are dictionary-ordered within a layer but not across the
+        // chain, so sort to get a single ascending pass over the range.
+        object_ids.sort_unstable();
+        object_ids.dedup();
+        if rev {
+            object_ids.reverse();
+        }
+
+        let mut out = Vec::new();
+        for oid in object_ids {
+            out.extend(self.selective_id_triples_o(head, oid).await?);
+        }
+        Ok(out)
+    }
+
+    /// The half-open value-dictionary-local id range `[start, end)` covering
+    /// `[low, high)` in one layer's value dictionary, or `None` if that
+    /// dictionary has no segment for the bounds' datatype.
+    async fn value_range_bounds(
+        &self,
+        layer: [u32; 5],
+        low: &tdb_succinct::TypedDictEntry,
+        high: &tdb_succinct::TypedDictEntry,
+    ) -> io::Result<Option<(u64, u64)>> {
+        use tdb_succinct::block::IdLookupResult;
+        // `Closest(i)` means the bound sorts just after id `i`, so the range
+        // starts at `i + 1`; `NotFound` means it sorts before the whole
+        // segment, so the range starts at the segment's first id.
+        let resolve = |r: IdLookupResult, id_offset: u64| match r {
+            IdLookupResult::Found(i) => i,
+            IdLookupResult::Closest(i) => i + 1,
+            IdLookupResult::NotFound => id_offset + 1,
+        };
+
+        #[cfg(feature = "object-store")]
+        {
+            let count = self.layer_store.get_value_count(layer).await?.unwrap_or(0);
+            if count >= BLOCK_LAZY_MIN_ENTRIES {
+                if let Some(src) = self.layer_store.block_source() {
+                    use crate::storage::consts::LayerFileEnum;
+                    let d = crate::storage::block_lazy::BlockLazyTypedDict::open(
+                        src,
+                        layer,
+                        LayerFileEnum::ValueDictionaryTypesPresent,
+                        LayerFileEnum::ValueDictionaryTypeOffsets,
+                        LayerFileEnum::ValueDictionaryOffsets,
+                        LayerFileEnum::ValueDictionaryBlocks,
+                    )
+                    .await?;
+                    let (lo, id_offset) = match d.lookup_entry(low).await? {
+                        Some(v) => v,
+                        None => return Ok(None),
+                    };
+                    let (hi, _) = match d.lookup_entry(high).await? {
+                        Some(v) => v,
+                        None => return Ok(None),
+                    };
+                    return Ok(Some((resolve(lo, id_offset), resolve(hi, id_offset))));
+                }
+            }
+        }
+
+        let dict = match self.layer_store.get_value_dictionary(layer).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let id_offset = match dict.type_segment(low.datatype()) {
+            Some((_, offset)) => offset,
+            None => return Ok(None),
+        };
+        Ok(Some((
+            resolve(dict.id_entry(low), id_offset),
+            resolve(dict.id_entry(high), id_offset),
+        )))
+    }
+
     /// Spawn a background task that keeps read depth bounded: every `interval`
     /// it rolls up (non-destructively) any label head whose effective layer
     /// stack exceeds `max_depth`. Returns the task handle; abort it to stop.
@@ -2110,6 +2237,24 @@ impl LazyLayer {
     pub async fn triples_p(&self, predicate: u64) -> io::Result<Vec<IdTriple>> {
         self.store
             .selective_id_triples_p(self.head, predicate)
+            .await
+    }
+    pub async fn triples_value_range(
+        &self,
+        low: &tdb_succinct::TypedDictEntry,
+        high: &tdb_succinct::TypedDictEntry,
+    ) -> io::Result<Vec<IdTriple>> {
+        self.store
+            .selective_id_triples_value_range(self.head, low, high, false)
+            .await
+    }
+    pub async fn triples_value_range_rev(
+        &self,
+        low: &tdb_succinct::TypedDictEntry,
+        high: &tdb_succinct::TypedDictEntry,
+    ) -> io::Result<Vec<IdTriple>> {
+        self.store
+            .selective_id_triples_value_range(self.head, low, high, true)
             .await
     }
     pub async fn triples_o(&self, object: u64) -> io::Result<Vec<IdTriple>> {

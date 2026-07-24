@@ -595,6 +595,20 @@ impl SyncLazyLayer {
     pub fn triples_p(&self, predicate: u64) -> io::Result<Vec<IdTriple>> {
         task_sync(self.inner.triples_p(predicate))
     }
+    pub fn triples_value_range(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_value_range(low, high))
+    }
+    pub fn triples_value_range_rev(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> io::Result<Vec<IdTriple>> {
+        task_sync(self.inner.triples_value_range_rev(low, high))
+    }
     pub fn triples_o(&self, object: u64) -> io::Result<Vec<IdTriple>> {
         task_sync(self.inner.triples_o(object))
     }
@@ -904,6 +918,49 @@ mod tests {
         let full = store.get_layer_from_id(head).unwrap().unwrap(); // materialized (Layer)
         let lazy = store.lazy_layer(head); // disk-less
         assert_eq!(head, lazy.name());
+
+        // value ranges: the bounds are deliberately chosen so the range is a
+        // strict subset -- an all-encompassing range would pass even if the
+        // bound arithmetic were wrong
+        let lo = <String as tdb_succinct::TdbDataType>::make_entry(&"o0100");
+        let hi = <String as tdb_succinct::TdbDataType>::make_entry(&"o0200");
+        let mut fr = full.triples_value_range(&lo, &hi).collect::<Vec<_>>();
+        let mut lr = lazy.triples_value_range(&lo, &hi).unwrap();
+        fr.sort();
+        lr.sort();
+        assert!(!fr.is_empty(), "value-range check must not be vacuous");
+        assert!(
+            fr.len() < full.triples().count(),
+            "range must be a strict subset"
+        );
+        assert_eq!(fr, lr);
+
+        let mut fr = full.triples_value_range_rev(&lo, &hi).collect::<Vec<_>>();
+        let mut lr = lazy.triples_value_range_rev(&lo, &hi).unwrap();
+        fr.sort();
+        lr.sort();
+        assert_eq!(fr, lr);
+        // and the reverse variant really is reversed
+        let objs: Vec<u64> = lazy
+            .triples_value_range_rev(&lo, &hi)
+            .unwrap()
+            .iter()
+            .map(|t| t.object)
+            .collect();
+        let mut ascending = objs.clone();
+        ascending.sort_unstable();
+        ascending.reverse();
+        assert_eq!(objs, ascending, "rev must yield descending object order");
+
+        // a bound whose datatype has no segment in the dictionary yields nothing
+        let int_lo = <u32 as tdb_succinct::TdbDataType>::make_entry(&1);
+        let int_hi = <u32 as tdb_succinct::TdbDataType>::make_entry(&99);
+        assert!(lazy
+            .triples_value_range(&int_lo, &int_hi)
+            .unwrap()
+            .is_empty());
+        // mismatched bound datatypes describe no range
+        assert!(lazy.triples_value_range(&lo, &int_hi).unwrap().is_empty());
 
         // forward resolution + existence
         let sid = full.subject_id("n0100");
