@@ -1788,6 +1788,27 @@ impl<M: ArchiveMetadataBackend + Unpin + 'static, D: ArchiveBackend + 'static> P
         self.data_backend.prefetch_layers(names).await
     }
 
+    async fn stack_names_hint(&self, name: [u32; 5]) -> io::Result<Option<Vec<[u32; 5]>>> {
+        // One request for the whole chain, instead of one round trip per
+        // ancestor. Manifests are stored head-first; callers want oldest-first.
+        let bytes = match self.metadata_backend.get_stack_manifest(name).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let manifest = match crate::storage::stack_manifest::StackManifest::decode(bytes) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        // Validate before trusting: it must be this layer's chain and non-empty.
+        // Anything else falls through to the authoritative walk.
+        if !manifest.is_for(name) || manifest.layers.is_empty() {
+            return Ok(None);
+        }
+        let mut chain = manifest.layers;
+        chain.reverse();
+        Ok(Some(chain))
+    }
+
     async fn warm_layer_stack(&self, name: [u32; 5]) -> io::Result<()> {
         // If a manifest is present, learn the whole ancestor chain in one GET
         // and warm every archive in parallel, so the sequential discovery/build

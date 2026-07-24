@@ -288,6 +288,57 @@ you control, which needs your credentials — the one thing no public endpoint
 can substitute for. The question is now sharp: does a 12-layer disk-less graph
 sustain roughly 550 queries/s against real S3 before 503 SlowDown appears?
 
+## Measured: Cloudflare R2 (real, credentialed)
+
+Run 2026-07-24 against a real R2 bucket, same 12-layer / 2,000-triple shape as
+the MinIO tier. Per-request latency ~55–63 ms from this host.
+
+**R2 accepts the ETag-conditional PUT** the label store's compare-and-swap needs
+— the one thing that could have ruled the backend out, and what
+`object_store`'s `LocalFileSystem` lacks. Writes, group commit, the bucket WAL
+and head updates all work.
+
+Request counts transferred exactly from MinIO: 24 for a selective existence
+check at depth 12, identical to loopback. Latency did not, and that is the point
+of running it.
+
+### The serial chain walk, and fixing it
+
+The first R2 run showed 1,663 ms for a query issuing 24 requests at ~63 ms each
+— essentially **serial**. The cause was chain discovery:
+`retrieve_layer_stack_names` walks parent pointers, and you cannot read layer
+N−1 until layer N's parent pointer tells you its id. Twelve layers, twelve
+sequential round trips, and no amount of downstream concurrency helps.
+
+A `.stack` manifest that records the whole chain in one object already existed
+and was already being written — but it was only used to warm caches, never for
+discovery, so the walk still happened. Wiring it into discovery (as a validated
+hint, with the authoritative walk as fallback) and probing layers concurrently:
+
+| | before | after |
+|---|---|---|
+| selective existence p50 | 1,663 ms | **407 ms** |
+| requests per query | 24 | 97 (25 get, 72 head) |
+
+**4.1× faster, at 4× the requests.** The extra requests are existence/size
+probes: the old code walked the chain and stopped at the first layer holding the
+string, while the new one probes every layer at once. That is the right trade
+when latency dominates and the wrong one when per-request billing does — R2
+bills per operation, so this is a genuine tension, not a clean win.
+
+Under load with warm caches the picture is much better: 105 queries/s at 2.69 ms
+p50, since immutable layers mean cached spans stay valid.
+
+### A measurement error worth recording
+
+The figures of "2 requests per layer" and "24 at depth 12" that appeared in
+earlier revisions of this document came from `profile_selective_request_breakdown`,
+which was recording only **ranged** GETs. Manifest, rollup-pointer and label
+reads are unranged and were invisible to it. Corrected, the same query costs
+5 / 9 / 17 / 49 requests at depth 1 / 2 / 4 / 12 — roughly double what was
+reported. The benchmark harness always counted every request, so its numbers
+were right; only the profiler's were not.
+
 ## Knobs
 
 | Env var | Default | Meaning |

@@ -1113,70 +1113,98 @@ impl Store {
         let ls = &self.layer_store;
         #[cfg(feature = "object-store")]
         let block_source = ls.block_source();
-        for i in (0..chain.len()).rev() {
-            let layer = chain[i];
-            // Skip layers whose dictionary is empty (0 new nodes/predicates):
-            // the string can only be introduced by a layer that actually adds
-            // it. This also avoids parsing an empty dictionary's zero-filled
-            // block structure, which the block codec rejects.
-            let count = match kind {
-                DictKind::Node => ls.get_node_count(layer).await?,
-                DictKind::Predicate => ls.get_predicate_count(layer).await?,
-            };
-            if count.unwrap_or(0) == 0 {
-                continue;
-            }
-            let local: Option<u64> = {
-                #[cfg(feature = "object-store")]
-                {
-                    // Block-lazy fetches the offset table plus O(log n) blocks;
-                    // for a small dictionary that overhead exceeds one whole-dict
-                    // GET, so only take the block-lazy path once the dictionary is
-                    // large enough to win (measured: it regresses below this).
-                    let use_block_lazy =
-                        count.unwrap_or(0) >= BLOCK_LAZY_MIN_ENTRIES && block_source.is_some();
-                    if let (true, Some(src)) = (use_block_lazy, &block_source) {
-                        let (off_f, blk_f) = match kind {
-                            DictKind::Node => (
-                                crate::storage::consts::LayerFileEnum::NodeDictionaryOffsets,
-                                crate::storage::consts::LayerFileEnum::NodeDictionaryBlocks,
-                            ),
-                            DictKind::Predicate => (
-                                crate::storage::consts::LayerFileEnum::PredicateDictionaryOffsets,
-                                crate::storage::consts::LayerFileEnum::PredicateDictionaryBlocks,
-                            ),
-                        };
-                        crate::storage::block_lazy::BlockLazyStringDict::open(
-                            src.clone(),
-                            layer,
-                            off_f,
-                            blk_f,
-                        )
-                        .await?
-                        .id_of_string(s)
-                        .await?
-                    } else {
+
+        // Probe every layer at once rather than walking the chain.
+        //
+        // A string lives in exactly one layer's dictionary -- the one that
+        // introduced it, since a layer stores only its new entries -- so the
+        // search order affects only how soon it stops, never the answer. Walking
+        // head-first stops early on a hit, but each step is a round trip that
+        // cannot start until the previous one finishes, so a 12-layer chain cost
+        // up to 24 serial round trips. That is invisible at 0.5 ms against a
+        // local MinIO and about 1.5 seconds against a real object store at 60 ms.
+        //
+        // Probing concurrently costs more requests when the string sits in a
+        // recent layer, but they overlap: the query takes one round trip instead
+        // of one per layer. Given object stores rate-limit and bill per request
+        // this is a real trade, and latency is what dominates here.
+        let probes = chain.iter().enumerate().map(|(i, &layer)| {
+            #[cfg(feature = "object-store")]
+            let block_source = block_source.clone();
+            async move {
+                // Skip layers whose dictionary is empty (0 new nodes/predicates):
+                // the string can only be introduced by a layer that actually adds
+                // it. This also avoids parsing an empty dictionary's zero-filled
+                // block structure, which the block codec rejects.
+                let count = match kind {
+                    DictKind::Node => ls.get_node_count(layer).await?,
+                    DictKind::Predicate => ls.get_predicate_count(layer).await?,
+                };
+                if count.unwrap_or(0) == 0 {
+                    return Ok::<_, io::Error>(None);
+                }
+                let local: Option<u64> = {
+                    #[cfg(feature = "object-store")]
+                    {
+                        // Block-lazy fetches the offset table plus O(log n)
+                        // blocks; for a small dictionary that overhead exceeds
+                        // one whole-dict GET, so only take the block-lazy path
+                        // once the dictionary is large enough to win (measured:
+                        // it regresses below this).
+                        let use_block_lazy =
+                            count.unwrap_or(0) >= BLOCK_LAZY_MIN_ENTRIES && block_source.is_some();
+                        if let (true, Some(src)) = (use_block_lazy, &block_source) {
+                            let (off_f, blk_f) = match kind {
+                                DictKind::Node => (
+                                    crate::storage::consts::LayerFileEnum::NodeDictionaryOffsets,
+                                    crate::storage::consts::LayerFileEnum::NodeDictionaryBlocks,
+                                ),
+                                DictKind::Predicate => (
+                                    crate::storage::consts::LayerFileEnum::PredicateDictionaryOffsets,
+                                    crate::storage::consts::LayerFileEnum::PredicateDictionaryBlocks,
+                                ),
+                            };
+                            crate::storage::block_lazy::BlockLazyStringDict::open(
+                                src.clone(),
+                                layer,
+                                off_f,
+                                blk_f,
+                            )
+                            .await?
+                            .id_of_string(s)
+                            .await?
+                        } else {
+                            resolve_full(ls, kind, layer, s).await?
+                        }
+                    }
+                    #[cfg(not(feature = "object-store"))]
+                    {
                         resolve_full(ls, kind, layer, s).await?
                     }
-                }
-                #[cfg(not(feature = "object-store"))]
-                {
-                    resolve_full(ls, kind, layer, s).await?
-                }
-            };
-            if let Some(local) = local {
-                let idmap = match kind {
-                    DictKind::Node => ls.get_node_value_idmap(layer).await?,
-                    DictKind::Predicate => ls.get_predicate_idmap(layer).await?,
                 };
-                let outer = match idmap {
-                    Some(m) => m.inner_to_outer(local),
-                    None => local,
-                };
-                return Ok(Some(outer + offsets[i]));
+                match local {
+                    None => Ok(None),
+                    Some(local) => {
+                        let idmap = match kind {
+                            DictKind::Node => ls.get_node_value_idmap(layer).await?,
+                            DictKind::Predicate => ls.get_predicate_idmap(layer).await?,
+                        };
+                        let outer = match idmap {
+                            Some(m) => m.inner_to_outer(local),
+                            None => local,
+                        };
+                        Ok(Some((i, outer + offsets[i])))
+                    }
+                }
             }
-        }
-        Ok(None)
+        });
+        let hits = futures::future::try_join_all(probes).await?;
+        // Newest wins, matching the head-first walk this replaced.
+        Ok(hits
+            .into_iter()
+            .flatten()
+            .max_by_key(|(i, _)| *i)
+            .map(|(_, id)| id))
     }
 
     /// Resolve a typed value to its value-dictionary-local id in `layer` (the id

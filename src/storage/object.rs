@@ -174,6 +174,10 @@ pub struct ObjectArchiveBackend {
     >,
     /// Single-flights the region fetch, like `header_locks` does for headers.
     region_locks: Arc<std::sync::Mutex<lru::LruCache<[u32; 5], Arc<tokio::sync::Mutex<()>>>>>,
+    /// Decoded stack manifests, cached by layer id. A manifest describes the
+    /// ancestor chain of a content-addressed layer, so it is valid forever, and
+    /// a query asks for the chain several times.
+    manifest_cache: Arc<tokio::sync::Mutex<lru::LruCache<[u32; 5], Option<Bytes>>>>,
     /// A structure at or below this size is coalesced with its neighbours into
     /// one ranged GET. Defaults from `TDB_COALESCE_MAX_STRUCTURE_BYTES`; zero
     /// disables coalescing, which is how tests select the uncoalesced path
@@ -203,6 +207,9 @@ impl ObjectArchiveBackend {
                 std::num::NonZeroUsize::new(1024).unwrap(),
             ))),
             region_locks: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(4096).unwrap(),
+            ))),
+            manifest_cache: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(4096).unwrap(),
             ))),
             coalesce_max: small_structure_max(),
@@ -636,15 +643,27 @@ impl ArchiveMetadataBackend for ObjectArchiveBackend {
     }
 
     async fn get_stack_manifest(&self, id: [u32; 5]) -> io::Result<Option<Bytes>> {
-        let path = self.stack_key(id);
-        match self.store.get(&path).await {
-            Ok(r) => Ok(Some(r.bytes().await.map_err(os_err_to_io)?)),
-            Err(OsError::NotFound { .. }) => Ok(None),
-            Err(e) => Err(os_err_to_io(e)),
+        // A query asks for the ancestor chain several times, and the manifest of
+        // a content-addressed layer never changes, so cache it -- including the
+        // absence, so a layer without one is not re-probed on every call.
+        if let Some(cached) = self.manifest_cache.lock().await.get(&id) {
+            return Ok(cached.clone());
         }
+        let path = self.stack_key(id);
+        let result = match self.store.get(&path).await {
+            Ok(r) => Some(r.bytes().await.map_err(os_err_to_io)?),
+            Err(OsError::NotFound { .. }) => None,
+            Err(e) => return Err(os_err_to_io(e)),
+        };
+        self.manifest_cache.lock().await.put(id, result.clone());
+        Ok(result)
     }
 
     async fn set_stack_manifest(&self, id: [u32; 5], bytes: Bytes) -> io::Result<()> {
+        self.manifest_cache
+            .lock()
+            .await
+            .put(id, Some(bytes.clone()));
         // Overwrite is safe: the manifest is keyed by an immutable,
         // content-addressed head, so it is written once for a unique layer.
         self.store
@@ -1202,7 +1221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn small_layer_costs_two_requests_not_ten() {
+    async fn coalescing_cuts_requests_for_one_layer() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1254,9 +1273,13 @@ mod tests {
             "one layer: coalesced {} requests, uncoalesced {} requests",
             coalesced, uncoalesced
         );
-        assert_eq!(
-            coalesced, 2,
-            "a layer should cost a header probe plus one coalesced span"
+        // Deliberately a relationship, not an exact count: an earlier version
+        // asserted "== 2", a figure taken from a profiler that was only
+        // recording *ranged* GETs and so missed manifest and rollup reads.
+        assert!(
+            coalesced <= 8,
+            "a single layer should stay in single digits of requests, got {}",
+            coalesced
         );
         assert!(
             uncoalesced > coalesced,
@@ -1524,13 +1547,20 @@ mod tests {
             l: &ObjectPath,
             o: GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            if let Some(GetRange::Bounded(r)) = &o.range {
-                self.ranges
-                    .lock()
-                    .unwrap()
-                    .push((l.to_string(), r.start, r.end));
-            }
-            self.inner.get_opts(l, o).await
+            // Record *every* GET, not only ranged ones. Manifest, rollup and
+            // label reads are unranged, and counting only ranged requests
+            // silently understated the per-query request total.
+            let bounded = match &o.range {
+                Some(GetRange::Bounded(r)) => Some((r.start, r.end)),
+                _ => None,
+            };
+            let res = self.inner.get_opts(l, o).await?;
+            let (start, end) = bounded.unwrap_or((0, res.meta.size as usize));
+            self.ranges
+                .lock()
+                .unwrap()
+                .push((l.to_string(), start, end));
+            Ok(res)
         }
         async fn delete(&self, l: &ObjectPath) -> object_store::Result<()> {
             self.inner.delete(l).await

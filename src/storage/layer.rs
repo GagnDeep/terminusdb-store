@@ -402,6 +402,23 @@ pub trait PersistentLayerStore: 'static + Send + Sync + Clone {
     }
 
     async fn directory_exists(&self, name: [u32; 5]) -> io::Result<bool>;
+
+    /// The ancestor chain, oldest-first, if the backend can produce it without
+    /// walking parent pointers.
+    ///
+    /// The default discovery walk reads one layer's parent pointer to learn the
+    /// next, so it costs a round trip per ancestor and they cannot overlap. That
+    /// is invisible against a local store and dominates everything against a
+    /// real object store -- a 12-layer chain measured 1.5 s on R2, almost all of
+    /// it this walk. A backend that persists a manifest can return the whole
+    /// chain in one request.
+    ///
+    /// Hint only: `None` falls back to the authoritative walk, so a missing,
+    /// stale or corrupt manifest costs latency and never correctness.
+    async fn stack_names_hint(&self, _name: [u32; 5]) -> io::Result<Option<Vec<[u32; 5]>>> {
+        Ok(None)
+    }
+
     async fn get_file(&self, directory: [u32; 5], name: &str) -> io::Result<Self::File>;
     async fn file_exists(&self, directory: [u32; 5], file: &str) -> io::Result<bool>;
 
@@ -2582,6 +2599,9 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
     }
 
     async fn retrieve_layer_stack_names(&self, name: [u32; 5]) -> io::Result<Vec<[u32; 5]>> {
+        if let Some(chain) = self.stack_names_hint(name).await? {
+            return Ok(chain);
+        }
         let mut result = vec![name];
 
         loop {
