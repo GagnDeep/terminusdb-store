@@ -174,6 +174,11 @@ pub struct ObjectArchiveBackend {
     >,
     /// Single-flights the region fetch, like `header_locks` does for headers.
     region_locks: Arc<std::sync::Mutex<lru::LruCache<[u32; 5], Arc<tokio::sync::Mutex<()>>>>>,
+    /// A structure at or below this size is coalesced with its neighbours into
+    /// one ranged GET. Defaults from `TDB_COALESCE_MAX_STRUCTURE_BYTES`; zero
+    /// disables coalescing, which is how tests select the uncoalesced path
+    /// deterministically rather than racing on a process-global.
+    coalesce_max: usize,
 }
 
 impl ObjectArchiveBackend {
@@ -200,6 +205,7 @@ impl ObjectArchiveBackend {
             region_locks: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(4096).unwrap(),
             ))),
+            coalesce_max: small_structure_max(),
         }
     }
 
@@ -209,6 +215,14 @@ impl ObjectArchiveBackend {
         } else {
             ObjectPath::from(format!("{}/{}", self.prefix, suffix))
         }
+    }
+
+    /// Disable request coalescing on this backend, so each structure read is
+    /// its own ranged GET. Used by the byte-frugality tests, which assert a
+    /// property of the uncoalesced path.
+    pub fn without_coalescing(mut self) -> Self {
+        self.coalesce_max = 0;
+        self
     }
 
     fn layer_key(&self, id: [u32; 5]) -> ObjectPath {
@@ -284,6 +298,7 @@ impl ObjectArchiveBackend {
                     .map_err(os_err_to_io)
             }
         };
+
         let mut probe = get_range(0..HEADER_PROBE_BYTES).await?;
         // The header is a file-presence u64 (8 bytes) followed by an offsets
         // logarray whose exact byte length is encoded in its control word, so the
@@ -333,7 +348,7 @@ impl ObjectArchiveBackend {
             return Ok(cached.clone());
         }
 
-        if small_structure_max() == 0 {
+        if self.coalesce_max == 0 {
             self.region_cache.lock().await.put(id, None);
             return Ok(None);
         }
@@ -342,7 +357,7 @@ impl ObjectArchiveBackend {
         for i in 0..64u64 {
             if let Some(f) = <LayerFileEnum as num_traits::FromPrimitive>::from_u64(i) {
                 if let Some(r) = header.range_for(f) {
-                    if r.end > r.start && r.end - r.start <= small_structure_max() {
+                    if r.end > r.start && r.end - r.start <= self.coalesce_max {
                         small.push((data_start + r.start)..(data_start + r.end));
                     }
                 }
@@ -392,9 +407,6 @@ impl ObjectArchiveBackend {
 
     /// Serve `abs` from the coalesced span if it lies inside one.
     async fn from_region(&self, id: [u32; 5], abs: &std::ops::Range<usize>) -> Option<Bytes> {
-        if abs.end - abs.start > small_structure_max() {
-            return None;
-        }
         let runs = self.small_region(id).await.ok()??;
         runs.iter().find_map(|(run, bytes)| {
             if abs.start >= run.start && abs.end <= run.end {
@@ -475,6 +487,13 @@ impl ArchiveBackend for ObjectArchiveBackend {
         let end = data_start + range.end;
         if start >= end {
             return Ok(BytesReader(Bytes::new()));
+        }
+        // Same coalescing as the other two read paths. This one carries the
+        // logarray control-word reads -- eight bytes at the end of a structure,
+        // three per query -- which is exactly the traffic the region cache
+        // exists to absorb.
+        if let Some(b) = self.from_region(id, &(start..end)).await {
+            return Ok(BytesReader(b));
         }
         let path = self.layer_key(id);
         let opts = GetOptions {
@@ -1113,13 +1132,148 @@ mod tests {
         }
     }
 
+    /// A small layer is fetched whole on first touch, so a selective query
+    /// costs two requests for it -- the size probe and the fetch -- instead of
+    /// the ~10 ranged GETs the block-lazy path needs, most of which were
+    /// eight-byte control-word reads. Everything after that is a memory read.
+    /// Counts requests rather than bytes.
+    #[derive(Debug)]
+    struct RequestCountingStore {
+        inner: Arc<dyn ObjectStore>,
+        requests: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl std::fmt::Display for RequestCountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RequestCountingStore")
+        }
+    }
+    #[async_trait]
+    impl ObjectStore for RequestCountingStore {
+        async fn put_opts(
+            &self,
+            l: &ObjectPath,
+            p: object_store::PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &ObjectPath,
+            o: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(
+            &self,
+            l: &ObjectPath,
+            o: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get_opts(l, o).await
+        }
+        async fn delete(&self, l: &ObjectPath) -> object_store::Result<()> {
+            self.inner.delete(l).await
+        }
+        fn list(
+            &self,
+            p: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(
+            &self,
+            p: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy(&self, f: &ObjectPath, t: &ObjectPath) -> object_store::Result<()> {
+            self.inner.copy(f, t).await
+        }
+        async fn copy_if_not_exists(
+            &self,
+            f: &ObjectPath,
+            t: &ObjectPath,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(f, t).await
+        }
+    }
+
+    #[tokio::test]
+    async fn small_layer_costs_two_requests_not_ten() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (head, target) = {
+            let store = crate::store::open_object_store(bucket.clone(), "", 1 << 30);
+            let db = store.create("g").await.unwrap();
+            let builder = store.create_base_layer().await.unwrap();
+            for i in 0..2000 {
+                builder
+                    .add_value_triple(ValueTriple::new_string_value(
+                        &format!("s{:05}", i),
+                        "p",
+                        &format!("o{:05}", i),
+                    ))
+                    .unwrap();
+            }
+            let layer = builder.commit().await.unwrap();
+            db.set_head(&layer).await.unwrap();
+            (
+                layer.name(),
+                ValueTriple::new_string_value("s01000", "p", "o01000"),
+            )
+        };
+
+        let count = |bucket: Arc<dyn ObjectStore>, c: Arc<AtomicU64>| -> Arc<dyn ObjectStore> {
+            Arc::new(RequestCountingStore {
+                inner: bucket,
+                requests: c,
+            })
+        };
+
+        let c_on = Arc::new(AtomicU64::new(0));
+        let s_on = crate::store::open_object_store(count(bucket.clone(), c_on.clone()), "", 0);
+        assert!(s_on
+            .selective_value_triple_exists(head, &target)
+            .await
+            .unwrap());
+        let coalesced = c_on.load(Ordering::Relaxed);
+
+        let c_off = Arc::new(AtomicU64::new(0));
+        let s_off = block_lazy_store(count(bucket.clone(), c_off.clone()), 0);
+        assert!(s_off
+            .selective_value_triple_exists(head, &target)
+            .await
+            .unwrap());
+        let uncoalesced = c_off.load(Ordering::Relaxed);
+
+        println!(
+            "one layer: coalesced {} requests, uncoalesced {} requests",
+            coalesced, uncoalesced
+        );
+        assert_eq!(
+            coalesced, 2,
+            "a layer should cost a header probe plus one coalesced span"
+        );
+        assert!(
+            uncoalesced > coalesced,
+            "uncoalesced should need more requests ({} vs {})",
+            uncoalesced,
+            coalesced
+        );
+    }
+
     #[tokio::test]
     async fn ranged_structure_read_transfers_less_than_whole_layer() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         // Build a layer big enough that one structure is a small part of it.
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let backend = ObjectArchiveBackend::new(bucket.clone(), "");
+        // exercises the block-lazy path, so disable the whole-layer fetch
+        let backend = ObjectArchiveBackend::new(bucket.clone(), "").without_coalescing();
         let store = ArchiveLayerStore::new(backend.clone(), backend.clone());
         let mut builder = store.create_base_layer().await.unwrap();
         let name = builder.name();
@@ -1142,7 +1296,7 @@ mod tests {
             inner: bucket.clone(),
             ranged_bytes: counter.clone(),
         });
-        let cbackend = ObjectArchiveBackend::new(counting, "");
+        let cbackend = ObjectArchiveBackend::new(counting, "").without_coalescing();
         // Read one small structure (the dictionary's block-offset table) — the
         // kind of targeted read a query makes when it does not need the whole
         // string dictionary. It should transfer far less than the whole layer.
@@ -1173,6 +1327,22 @@ mod tests {
     /// Phase 3, Stage 1a: a selective (adjacency-only) existence check transfers
     /// far fewer bytes than a full `get_layer`, because it never fetches the
     /// (large) dictionary, object index, or wavelet tree.
+    /// A store whose object backend has the whole-layer fetch disabled, so a
+    /// test can exercise the block-lazy path deterministically.
+    fn block_lazy_store(bucket: Arc<dyn ObjectStore>, cache: usize) -> crate::store::Store {
+        use crate::storage::archive::{ArchiveLayerStore, LruArchiveBackend};
+        use crate::storage::{CachedLayerStore, LockingHashMapLayerCache};
+        let backend = ObjectArchiveBackend::new(bucket.clone(), String::new()).without_coalescing();
+        let archive = LruArchiveBackend::new(backend.clone(), backend, cache);
+        crate::store::Store::new(
+            ObjectLabelStore::new(bucket, String::new()),
+            CachedLayerStore::new(
+                ArchiveLayerStore::new(archive.clone(), archive),
+                LockingHashMapLayerCache::new(),
+            ),
+        )
+    }
+
     #[tokio::test]
     async fn selective_exists_transfers_less_than_full_layer() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1207,12 +1377,11 @@ mod tests {
         // Measure the selective existence check on a fresh, cold, RAM-cache-off
         // store (so reads are ranged, not whole-archive).
         let c_sel = Arc::new(AtomicU64::new(0));
-        let s_sel = crate::store::open_object_store(
+        let s_sel = block_lazy_store(
             Arc::new(CountingStore {
                 inner: bucket.clone(),
                 ranged_bytes: c_sel.clone(),
             }),
-            "",
             0,
         );
         assert!(s_sel.selective_id_triple_exists(head, idt).await.unwrap());
@@ -1278,12 +1447,11 @@ mod tests {
         let target = ValueTriple::new_string_value("s10", "p", "o10");
 
         let c_sel = Arc::new(AtomicU64::new(0));
-        let s_sel = crate::store::open_object_store(
+        let s_sel = block_lazy_store(
             Arc::new(CountingStore {
                 inner: bucket.clone(),
                 ranged_bytes: c_sel.clone(),
             }),
-            "",
             0,
         );
         assert!(s_sel
@@ -1547,6 +1715,12 @@ class at ~{} queries/s",
             if busiest > 0 { 5500 / busiest } else { 0 }
         );
 
+        if std::env::var("PROFILE_RAW").is_ok() {
+            println!("\nraw requests:");
+            for (k, a, b) in ranges.lock().unwrap().iter() {
+                println!("  {:>9}..{:<9} ({:>6} B)  {}", a, b, b - a, k);
+            }
+        }
         let mut rows: Vec<_> = by_structure.into_iter().collect();
         rows.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
         println!(
