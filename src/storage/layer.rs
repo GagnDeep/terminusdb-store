@@ -85,6 +85,15 @@ pub trait LayerStore: 'static + Packable + Send + Sync {
         Ok(())
     }
 
+    /// Whether a layer with this name exists, without materializing it.
+    ///
+    /// The default has to load the layer to find out, which is exactly what a
+    /// disk-less caller is trying to avoid; backends with a cheap existence
+    /// probe (a HEAD, or a cached archive header) should override it.
+    async fn layer_exists(&self, name: [u32; 5]) -> io::Result<bool> {
+        Ok(self.get_layer(name).await?.is_some())
+    }
+
     /// A block source for driving block-lazy dictionaries, if this store's
     /// backend supports ranged structure reads. Default `None` (whole-structure
     /// backends fall back to loading full dictionaries).
@@ -1482,6 +1491,12 @@ impl<F: 'static + FileLoad + FileStore + Clone, T: 'static + PersistentLayerStor
 {
     async fn layers(&self) -> io::Result<Vec<[u32; 5]>> {
         self.directories().await
+    }
+
+    /// A persistent store can answer this from its directory/archive index --
+    /// on the object backend a cached header, no layer load at all.
+    async fn layer_exists(&self, name: [u32; 5]) -> io::Result<bool> {
+        self.directory_exists(name).await
     }
 
     #[cfg(feature = "object-store")]

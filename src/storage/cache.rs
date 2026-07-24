@@ -260,6 +260,10 @@ impl LayerStore for CachedLayerStore {
             .await
     }
 
+    async fn layer_exists(&self, name: [u32; 5]) -> io::Result<bool> {
+        self.inner.layer_exists(name).await
+    }
+
     async fn get_layer_with_cache(
         &self,
         name: [u32; 5],

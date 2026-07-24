@@ -1775,6 +1775,13 @@ impl Store {
         }
     }
 
+    /// Whether a layer exists, without materializing it. Pairs with
+    /// [`lazy_layer`](Self::lazy_layer), which hands out a handle for any name
+    /// and so cannot itself report that the layer is unknown.
+    pub async fn layer_exists(&self, layer: [u32; 5]) -> io::Result<bool> {
+        self.layer_store.layer_exists(layer).await
+    }
+
     /// Resolve a triple object (node or typed value) to its global id, walking
     /// the chain head-first. See [`resolve_dict_id`](Self::resolve_dict_id) and
     /// [`resolve_value_local_id`](Self::resolve_value_local_id).
@@ -2053,6 +2060,11 @@ impl LazyLayer {
             .layer_store
             .get_layer_parent_name(self.head)
             .await
+    }
+
+    /// This layer's parent as another disk-less handle, if it has one.
+    pub async fn parent(&self) -> io::Result<Option<LazyLayer>> {
+        Ok(self.parent_name().await?.map(|p| self.store.lazy_layer(p)))
     }
 
     /// The whole ancestor chain, head first — the same order

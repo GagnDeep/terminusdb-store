@@ -567,6 +567,9 @@ impl SyncLazyLayer {
     pub fn parent_name(&self) -> io::Result<Option<[u32; 5]>> {
         task_sync(self.inner.parent_name())
     }
+    pub fn parent(&self) -> io::Result<Option<SyncLazyLayer>> {
+        Ok(task_sync(self.inner.parent())?.map(|inner| SyncLazyLayer { inner }))
+    }
     pub fn retrieve_layer_stack_names(&self) -> io::Result<Vec<[u32; 5]>> {
         task_sync(self.inner.retrieve_layer_stack_names())
     }
@@ -759,6 +762,11 @@ impl SyncStore {
         SyncLazyLayer {
             inner: self.inner.lazy_layer(layer),
         }
+    }
+
+    /// Whether a layer exists, without materializing it.
+    pub fn layer_exists(&self, layer: [u32; 5]) -> io::Result<bool> {
+        task_sync(self.inner.layer_exists(layer))
     }
 
     /// Create a base layer builder, unattached to any database label.
@@ -972,6 +980,12 @@ mod tests {
 
         let full = store.get_layer_from_id(head).unwrap().unwrap(); // materialized head
         let lazy = store.lazy_layer(head); // disk-less
+
+        // existence, without materializing: true for a real layer, false for a
+        // well-formed name that was never stored (which is what store_id_layer
+        // relies on to fail rather than hand out a doomed handle)
+        assert!(store.layer_exists(head).unwrap());
+        assert!(!store.layer_exists([0xdead, 0xbeef, 0, 0, 0]).unwrap());
 
         // chain metadata over a real base+child chain, so the cumulative sums
         // are actually exercised rather than trivially matching a single layer
